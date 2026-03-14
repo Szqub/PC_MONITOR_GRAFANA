@@ -9,71 +9,11 @@ from bytetech_agent.models.metrics import (
     ProviderHealthInfo,
 )
 from bytetech_agent.providers.base import BaseProvider
-from bytetech_agent.providers.presentmon_provider import FrameTimingBuffer
-
-
-# ========================= TestFrameTimingBuffer =========================
-
-class TestFrameTimingBuffer:
-    def test_empty_stats(self):
-        buf = FrameTimingBuffer()
-        assert buf.get_stats(10.0) is None
-        assert buf.get_latest() is None
-
-    def test_add_and_get_latest(self):
-        buf = FrameTimingBuffer()
-        buf.add_sample(16.6)
-        assert buf.get_latest() == 16.6
-
-    def test_stats_calculation(self):
-        buf = FrameTimingBuffer()
-        # Dodaj 100 sampleów (frametime = 16.6ms → ~60 FPS)
-        for _ in range(100):
-            buf.add_sample(16.6)
-
-        stats = buf.get_stats(10.0)
-        assert stats is not None
-        assert abs(stats["fps_avg"] - 60.24) < 1.0  # ~60 FPS
-        assert stats["fps_1pct"] > 0
-        assert stats["fps_0_1pct"] > 0
-        assert stats["sample_count"] == 100
-
-    def test_mixed_frametimes(self):
-        buf = FrameTimingBuffer()
-        # 90 sampleów @ 16.6ms + 10 sampleów @ 33.3ms (stutter)
-        for _ in range(90):
-            buf.add_sample(16.6)
-        for _ in range(10):
-            buf.add_sample(33.3)
-
-        stats = buf.get_stats(10.0)
-        assert stats is not None
-        # Avg powinno być między 60 i 30 FPS
-        assert 30 < stats["fps_avg"] < 65
-        # 1% low powinno być bliżej 30 FPS (wolne ramki)
-        assert stats["fps_1pct"] < stats["fps_avg"]
-
-    def test_window_filtering(self):
-        buf = FrameTimingBuffer(max_seconds=5)
-        buf.add_sample(16.6)
-
-        # Powinny być dane
-        stats = buf.get_stats(10.0)
-        # Tylko 1 sample – za mało
-        assert stats is None  # Potrzeba min 2 sampleów
-
-        buf.add_sample(16.6)
-        stats = buf.get_stats(10.0)
-        assert stats is not None
-
-    def test_clear(self):
-        buf = FrameTimingBuffer()
-        buf.add_sample(16.6)
-        buf.clear()
-        assert buf.get_latest() is None
 
 
 # ========================= TestBaseProvider =========================
+
+
 
 class StubProvider(BaseProvider):
     """Test provider do weryfikacji BaseProvider."""

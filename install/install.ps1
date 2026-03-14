@@ -319,8 +319,21 @@ try {
 # ========================= STEP 6: PresentMon Check =========================
 Write-Step "6/9" "Checking PresentMon dependencies..."
 
+try {
+    Write-Info "Checking via winget if Intel.PresentMon is installed..."
+    $pm_installed = & winget list --id Intel.PresentMon 2>&1
+    if (-not ($pm_installed -match "Intel.PresentMon")) {
+        Write-Info "Intel PresentMon not found. Attempting automatic installation via winget..."
+        & winget install -e --id Intel.PresentMon --accept-source-agreements --accept-package-agreements --silent 2>&1 | Out-Null
+    }
+} catch {
+    Write-Info "Winget failed or is unavailable. Proceeding to path check."
+}
+
 $pmFound = $false
 $pmPaths = @(
+    "$env:ProgramFiles\Intel\PresentMonSharedService\PresentMonAPI2.dll",
+    "$env:ProgramFiles\Intel\PresentMon\PresentMonApplication\PresentMonAPI2Loader.dll",
     "$env:ProgramFiles\PresentMon\PresentMonAPI2.dll",
     "$env:ProgramFiles\PresentMon\PresentMonAPI.dll",
     "${env:ProgramFiles(x86)}\PresentMon\PresentMonAPI2.dll",
@@ -406,15 +419,15 @@ Write-Step "8/9" "Registering Scheduled Task..."
 $TaskName = "ByteTechAgent"
 try {
     $Action = New-ScheduledTaskAction `
-        -Execute "$InstallDir\venv\Scripts\python.exe" `
+        -Execute "$InstallDir\venv\Scripts\pythonw.exe" `
         -Argument "-m bytetech_agent" `
         -WorkingDirectory $InstallDir
 
-    $Trigger = New-ScheduledTaskTrigger -AtStartup
+    $Trigger = New-ScheduledTaskTrigger -AtLogOn
 
     $Principal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
-        -LogonType ServiceAccount `
+        -UserId $env:USERNAME `
+        -LogonType Interactive `
         -RunLevel Highest
 
     $Settings = New-ScheduledTaskSettingsSet `
