@@ -207,7 +207,7 @@ class MyProvider(BaseProvider):
 
     def _collect(self, context: ProviderContext) -> list[MetricData]:
         return [MetricData(
-            measurement_name="pc_hw_curated",
+            measurement_name="pc_cpu",
             tags={"host": context.host_alias, "device_class": "custom"},
             fields={"my_value": real_value},
         )]

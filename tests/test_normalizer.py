@@ -40,7 +40,7 @@ class TestNormalizeToCurated:
         raw = [_make_raw_metric("cpu", "temperature", "CPU Package", 65.0)]
         curated = InfluxFormatter.normalize_to_curated(raw)
         assert len(curated) == 1
-        assert curated[0].measurement_name == "pc_hw_curated"
+        assert curated[0].measurement_name == "pc_cpu"
         assert curated[0].tags["device_class"] == "cpu"
         assert "cpu_package_temp_c" in curated[0].fields
         assert curated[0].fields["cpu_package_temp_c"] == 65.0

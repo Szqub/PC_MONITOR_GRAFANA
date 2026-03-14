@@ -90,7 +90,7 @@ class InfluxFormatter:
     @staticmethod
     def normalize_to_curated(raw_metrics: List[MetricData]) -> List[MetricData]:
         """
-        Przekształca surowe metryki LHM (pc_hw_raw) na znormalizowane pc_hw_curated.
+        Przekształca surowe metryki LHM (pc_hw_raw) na dedykowane metryki rozdzielone per klasa urządzenia (pc_cpu, pc_gpu, itp).
         Grupuje metryki po (host, device_class, device_name) → jedno MetricData per urządzenie.
         """
         # Grupowanie: (host, device_class, device_name) → {field: value}
@@ -180,12 +180,24 @@ class InfluxFormatter:
             if key in curated_groups:
                 curated_groups[key].update(fans)
 
+        # Mapping device_class to split measurement names
+        measurement_routing = {
+            "cpu": "pc_cpu",
+            "dgpu": "pc_gpu",
+            "igpu": "pc_gpu",
+            "ram": "pc_memory",
+            "storage": "pc_storage",
+            "motherboard": "pc_motherboard",
+        }
+
         # Buduj curated MetricData
         curated_metrics: List[MetricData] = []
         for key, fields in curated_groups.items():
             if fields:  # Nie emituj pustych
+                device_class = curated_tags[key]["device_class"]
+                measurement_name = measurement_routing.get(device_class, "pc_hw_curated")
                 curated_metrics.append(MetricData(
-                    measurement_name="pc_hw_curated",
+                    measurement_name=measurement_name,
                     tags=curated_tags[key],
                     fields=fields,
                 ))

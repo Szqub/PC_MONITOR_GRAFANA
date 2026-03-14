@@ -301,74 +301,63 @@ class LhmProvider(BaseProvider):
         node: dict,
         context: ProviderContext,
         metrics: List[MetricData],
-        hw_type: str,
-        hw_name: str,
-        hw_identifier: str,
         depth: int = 0,
+        **kwargs
     ):
         """
-        Recursively walk the LHM data.json tree.
-
-        Structure:
-          Level 0: root (Computer)
-          Level 1: hardware nodes (CPU, GPU, RAM, etc.) - have ImageURL
-          Level 2: sensor categories (Temperatures, Clocks, etc.) - Text = category name
-          Level 3: individual sensors - have Value field
+        Recursively walk the LHM data.json tree dynamically.
         """
+        # Inherit context from parents
+        hw_type = kwargs.get("hw_type", "")
+        hw_name = kwargs.get("hw_name", "")
+        hw_identifier = kwargs.get("hw_identifier", "")
+        sensor_category = kwargs.get("sensor_category", "")
+
         children = node.get("Children", [])
         text = node.get("Text", "")
         image_url = node.get("ImageURL", "")
         value_str = node.get("Value", "")
         min_str = node.get("Min", "")
         max_str = node.get("Max", "")
+        node_type = node.get("Type", "")
 
-        # Level 1: hardware node detection
-        if depth == 1:
+        # Detect Hardware Nodes (Level where HardwareId exists or it looks like hardware image)
+        if "HardwareId" in node or (image_url and any(x in image_url for x in ["cpu", "nvidia", "amd", "ram", "hdd", "mainboard"])):
             hw_name = text
-            hw_identifier = text  # Use text as identifier for JSON
-            # Detect hardware type from ImageURL
+            hw_identifier = node.get("HardwareId", text)
+            
             img_name = image_url.split("/")[-1] if image_url else ""
             hw_type = _JSON_IMAGE_MAP.get(img_name, "")
             if not hw_type:
-                # Fallback: guess from text
                 text_lower = text.lower()
-                if "cpu" in text_lower or "processor" in text_lower:
+                if "cpu" in text_lower or "processor" in text_lower or "ryzen" in text_lower or "intel" in text_lower:
                     hw_type = "CPU"
-                elif "nvidia" in text_lower or "geforce" in text_lower:
+                elif "nvidia" in text_lower or "geforce" in text_lower or "rtx" in text_lower:
                     hw_type = "GpuNvidia"
-                elif "radeon" in text_lower or "amd" in text_lower:
+                elif "radeon" in text_lower or "rx" in text_lower:
                     hw_type = "GpuAmd"
-                elif "intel" in text_lower and ("arc" in text_lower or "gpu" in text_lower or "graphics" in text_lower):
-                    hw_type = "GpuIntel"
                 elif "memory" in text_lower or "ram" in text_lower:
                     hw_type = "RAM"
-                elif "motherboard" in text_lower or "mainboard" in text_lower:
+                elif "motherboard" in text_lower or "aorus" in text_lower or "msi" in text_lower:
                     hw_type = "Motherboard"
-                elif any(s in text_lower for s in ["ssd", "hdd", "nvme", "disk", "storage"]):
+                elif any(s in text_lower for s in ["ssd", "nvme", "disk"]):
                     hw_type = "Storage"
-                elif "network" in text_lower or "ethernet" in text_lower or "wifi" in text_lower:
-                    hw_type = "Network"
 
-        # Level 2: sensor category (Temperatures, Clocks, Loads, etc.)
-        sensor_type = ""
-        if depth == 2:
-            sensor_type = self._guess_sensor_type(text)
+        # Detect Sensor Categories (e.g. "Temperatures", "Loads")
+        if not value_str and len(children) > 0:
+            guessed_cat = self._guess_sensor_type(text)
+            if guessed_cat != text: # Match found
+                sensor_category = guessed_cat
 
-        # Level 3: actual sensor with value
-        if depth == 3 and value_str:
+        # Actual sensor with value
+        if value_str and "SensorId" in node:
             parsed_value = self._parse_sensor_value(value_str)
             if parsed_value is not None and hw_type:
                 device_class = _HW_TYPE_MAP.get(hw_type, "other")
-                sensor_category = self._guess_sensor_type(
-                    node.get("_parent_text", "")
-                )
-                if not sensor_category:
-                    # Try to infer from the grandparent
-                    sensor_category = "unknown"
-
-                sensor_type_clean = _SENSOR_TYPE_MAP.get(
-                    sensor_category, sensor_category.lower()
-                )
+                
+                cat = node_type if node_type else sensor_category
+                if not cat: cat = "unknown"
+                sensor_type_clean = _SENSOR_TYPE_MAP.get(cat, cat.lower())
 
                 tags = {
                     "host": context.host_alias,
@@ -376,7 +365,7 @@ class LhmProvider(BaseProvider):
                     "device_name": hw_name,
                     "sensor_type": sensor_type_clean,
                     "sensor_name": text,
-                    "identifier": f"/{hw_identifier}/{sensor_type_clean}/{text}",
+                    "identifier": node.get("SensorId", f"/{hw_identifier}/{sensor_type_clean}/{text}"),
                 }
                 fields: Dict[str, float] = {"value": parsed_value}
 
@@ -393,16 +382,14 @@ class LhmProvider(BaseProvider):
                     fields=fields,
                 ))
 
-        # Recurse into children, propagating parent context
+        # Recurse into children
         for child in children:
-            # Inject parent text for sensor type detection at depth 3
-            if depth == 2:
-                child["_parent_text"] = text
             self._walk_json_tree(
                 child, context, metrics,
                 hw_type=hw_type,
                 hw_name=hw_name,
                 hw_identifier=hw_identifier,
+                sensor_category=sensor_category,
                 depth=depth + 1,
             )
 
