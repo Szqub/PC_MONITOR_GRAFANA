@@ -69,8 +69,8 @@ class TestMetadataConfig:
 class TestTimingConfig:
     def test_defaults(self):
         cfg = TimingConfig()
-        assert cfg.hw_interval_sec == 10
-        assert cfg.fps_interval_sec == 2
+        assert cfg.hw_interval_sec == 2
+        assert cfg.fps_interval_sec == 1
 
     def test_custom_values(self):
         cfg = TimingConfig(hw_interval_sec=30, fps_interval_sec=5)
@@ -106,7 +106,7 @@ class TestBufferConfig:
 class TestOptionsConfig:
     def test_retention_hint_days(self):
         cfg = OptionsConfig()
-        assert cfg.retention_hint_days == 30
+        assert cfg.retention_hint_days == 2
 
     def test_custom_retention(self):
         cfg = OptionsConfig(retention_hint_days=90)
@@ -119,7 +119,7 @@ class TestAppConfig:
         cfg = AppConfig(**data)
         assert cfg.influx.url == "http://localhost:8086"
         assert cfg.metadata.host_alias == "TestPC"
-        assert cfg.timing.hw_interval_sec == 10
+        assert cfg.timing.hw_interval_sec == 2
         assert cfg.providers.lhm_enabled is True
         assert cfg.buffer.enabled is True
 

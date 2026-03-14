@@ -228,8 +228,8 @@ metadata:
   owner: "$owner"
 
 timing:
-  hw_interval_sec: 10
-  fps_interval_sec: 2
+  hw_interval_sec: 2
+  fps_interval_sec: 1
 
 providers:
   lhm_enabled: true
@@ -260,7 +260,9 @@ options:
   tags_extra:
     device_class: "desktop"
   custom_fields: {}
-  retention_hint_days: 30
+  # Note: retention_hint_days is an agent-side hint only.
+  # Actual retention MUST be configured on the InfluxDB bucket itself.
+  retention_hint_days: 2
 "@
     Set-Content -Path $ConfigDestination -Value $configContent -Encoding UTF8
     Write-Ok "config.yaml generated"

@@ -22,8 +22,8 @@ class MetadataConfig(BaseModel):
 
 
 class TimingConfig(BaseModel):
-    hw_interval_sec: int = 10
-    fps_interval_sec: int = 2
+    hw_interval_sec: int = 2
+    fps_interval_sec: int = 1
 
 
 class ProvidersConfig(BaseModel):
@@ -61,7 +61,9 @@ class BufferConfig(BaseModel):
 class OptionsConfig(BaseModel):
     tags_extra: Dict[str, str] = Field(default_factory=dict)
     custom_fields: Dict[str, Any] = Field(default_factory=dict)
-    retention_hint_days: int = 30
+    # Note: retention_hint_days is an agent-side hint only.
+    # Actual retention MUST be configured on the InfluxDB bucket itself.
+    retention_hint_days: int = 2
 
 
 class AppConfig(BaseModel):
