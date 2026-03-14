@@ -72,6 +72,12 @@ def _match_curated_field(device_class: str, sensor_type: str, sensor_name: str) 
     sensor_type_lower = sensor_type.lower()
     device_class_lower = device_class.lower()
 
+    # Block static threshold/limit sensors for storage devices
+    # (e.g. "Temperature Limit", "Critical Temperature", "Temperature Trip")
+    if device_class_lower == "storage" and sensor_type_lower == "temperature":
+        if any(bad in sensor_name_lower for bad in ["limit", "critical", "trip", "warning"]):
+            return None
+
     # Dokładne dopasowanie
     for (dc, st, name_part), field_name in _CURATED_MAP.items():
         if dc == device_class_lower and st == sensor_type_lower and name_part in sensor_name_lower:

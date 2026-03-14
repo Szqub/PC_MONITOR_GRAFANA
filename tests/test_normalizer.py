@@ -88,6 +88,21 @@ class TestNormalizeToCurated:
         assert len(curated) == 1
         assert curated[0].fields.get("storage_temp_c") == 38.0
 
+    def test_storage_temperature_filter(self):
+        """Storage threshold/limit temperatures (e.g. Critical Temperature) must not be emitted."""
+        raw = [
+            _make_raw_metric("storage", "temperature", "Temperature", 45.0, "NVMe Drive 1"),
+            _make_raw_metric("storage", "temperature", "Critical Temperature", 93.0, "NVMe Drive 1"),
+            _make_raw_metric("storage", "temperature", "Temperature Limit", 85.0, "NVMe Drive 1"),
+            _make_raw_metric("storage", "temperature", "Temperature Warning", 80.0, "NVMe Drive 1")
+        ]
+        
+        curated = InfluxFormatter.normalize_to_curated(raw)
+        assert len(curated) == 1
+        assert curated[0].measurement_name == "pc_storage"
+        assert len(curated[0].fields) == 1
+        assert curated[0].fields["storage_temp_c"] == 45.0
+
     def test_per_core_aggregation(self):
         raw = [
             _make_raw_metric("cpu", "temperature", "CPU Package", 65.0),  # direct map

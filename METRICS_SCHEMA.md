@@ -61,7 +61,7 @@ These measurements contain actual telemetry values collected by the underlying p
 - `storage_data_read_gb` (float)
 - `storage_data_written_gb` (float)
 - `storage_read_rate_bps` (float)
-- `storage_temp_c` (float)
+- `storage_temp_c` (float) - *Live composite temperature only. Static hardware/firmware threshold limits (like Critical, Limit, or Trip sensors) are intentionally excluded.*
 - `storage_used_percent` (float)
 - `storage_write_rate_bps` (float)
 
