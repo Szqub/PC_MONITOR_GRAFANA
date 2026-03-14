@@ -1,0 +1,10 @@
+{
+    "site_package_search_strategy": "all",
+    "source_directories": ["."],
+    "search_path": [
+        "C:\\Users\\Firell\\AppData\\Local\\Programs\\Python\\Python312\\Lib",
+        "C:\\Users\\Firell\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages"
+    ],
+    "python_version": "3.12",
+    "typeshed": "C:\\Users\\Firell\\AppData\\Local\\Programs\\Python\\Python312\\Lib"
+}

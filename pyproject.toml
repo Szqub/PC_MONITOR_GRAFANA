@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bytetech-agent"
+version = "1.0.0"
+description = "Modularny agent monitoringu PC dla Windows – metryki hardware i FPS do InfluxDB 2.x"
+requires-python = ">=3.10"
+dependencies = [
+    "influxdb-client>=1.36.0",
+    "pyyaml>=6.0.1",
+    "psutil>=5.9.8",
+    "wmi>=1.5.1",
+    "pydantic>=2.6.3",
+    "pynvml>=11.5.0",
+    "pywin32>=306",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["bytetech_agent*"]
