@@ -16,6 +16,7 @@ $ErrorActionPreference = "Stop"
 $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $SourceDir
 $InstallDir = "C:\ByteTechAgent"
+$BinDir = "$InstallDir\bin"
 
 function Write-Title($text) {
     Write-Host ""
@@ -41,6 +42,22 @@ function Write-Info($text) {
     Write-Host "  [INFO] $text" -ForegroundColor Gray
 }
 
+function Select-ExistingFile($title) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = $title
+        $dialog.Filter = "Executable (*.exe)|*.exe|All files (*.*)|*.*"
+        $dialog.Multiselect = $false
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            return $dialog.FileName
+        }
+    } catch {
+        Write-Info "Browse dialog unavailable: $_"
+    }
+    return ""
+}
+
 # Status tracking
 $status = @{
     config_generated = $false
@@ -48,6 +65,7 @@ $status = @{
     influx_test_write = $false
     lhm_detected_wmi = $false
     lhm_detected_json = $false
+    rtss_detected = $false
     presentmon_detected = $false
     python_ok = $false
     venv_ok = $false
@@ -65,6 +83,11 @@ if (-not (Test-Path -Path $InstallDir)) {
     Write-Ok "Created $InstallDir"
 } else {
     Write-Info "Directory $InstallDir already exists. Files will be overwritten."
+}
+
+if (-not (Test-Path -Path $BinDir)) {
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+    Write-Ok "Created $BinDir"
 }
 
 # ========================= STEP 2: Copying Files =========================
@@ -206,9 +229,57 @@ if ($needsConfig) {
     
     $display_enabled = Read-Host "    Enable Display Provider? (Y/N, default Y)"
     if ($display_enabled -eq 'N' -or $display_enabled -eq 'n') { $display_val = "false" } else { $display_val = "true" }
-    
-    $presentmon_enabled = Read-Host "    Enable PresentMon (FPS)? (Y/N, default Y)"
-    if ($presentmon_enabled -eq 'N' -or $presentmon_enabled -eq 'n') { $pm_val = "false" } else { $pm_val = "true" }
+
+    Write-Host ""
+    Write-Host "  FPS backend selection:" -ForegroundColor White
+    $fps_backend = Read-Host "    FPS backend (default rtss_shared_memory)"
+    if (-not $fps_backend) { $fps_backend = "rtss_shared_memory" }
+
+    $fps_fallback = Read-Host "    Enable PresentMon console fallback/diagnostics? (Y/N, default N)"
+    if ($fps_fallback -eq 'Y' -or $fps_fallback -eq 'y') {
+        $fps_fallback_backend = "presentmon_console"
+        $pm_val = "true"
+    } else {
+        $fps_fallback_backend = ""
+        $pm_val = "false"
+    }
+
+    $presentmon_final_path = ""
+    if ($pm_val -eq "true") {
+        $defaultPmPath = "$BinDir\PresentMon.exe"
+        if (Test-Path -Path $defaultPmPath) {
+            Write-Ok "Standalone PresentMon already exists at $defaultPmPath"
+            $presentmon_final_path = $defaultPmPath
+        } else {
+            Write-Info "Standalone PresentMon console executable is required only for fallback/diagnostics."
+            Write-Info "Do NOT use the GUI PresentMonApplication path."
+            $pmSourcePath = Read-Host "    Path to standalone PresentMon.exe (leave blank to browse)"
+            if (-not $pmSourcePath) {
+                $pmSourcePath = Select-ExistingFile "Select standalone PresentMon.exe"
+            }
+
+            if ($pmSourcePath -and (Test-Path -Path $pmSourcePath)) {
+                if ($pmSourcePath -match 'PresentMonApplication') {
+                    Write-Fail "GUI PresentMonApplication path is not allowed. Use standalone console executable."
+                    $pm_val = "false"
+                    $fps_fallback_backend = ""
+                } else {
+                    $copyPm = Read-Host "    Copy PresentMon.exe to $defaultPmPath ? (Y/N, default Y)"
+                    if (-not $copyPm -or $copyPm -eq 'Y' -or $copyPm -eq 'y') {
+                        Copy-Item -Path $pmSourcePath -Destination $defaultPmPath -Force
+                        $presentmon_final_path = $defaultPmPath
+                        Write-Ok "Copied standalone PresentMon.exe to $defaultPmPath"
+                    } else {
+                        $presentmon_final_path = $pmSourcePath
+                    }
+                }
+            } else {
+                Write-Info "PresentMon fallback disabled because no standalone executable was provided."
+                $pm_val = "false"
+                $fps_fallback_backend = ""
+            }
+        }
+    }
 
     $influx_url = "http://${influx_host}:${influx_port}"
 
@@ -231,9 +302,14 @@ timing:
   hw_interval_sec: 2
   fps_interval_sec: 1
 
+fps:
+  backend: "$fps_backend"
+  fallback_backend: "$fps_fallback_backend"
+
 providers:
   lhm_enabled: true
   presentmon_enabled: $pm_val
+  fps_provider_enabled: true
   display_provider_enabled: $display_val
   nvapi_provider_enabled: $nvapi_val
   system_provider_enabled: true
@@ -241,10 +317,15 @@ providers:
 lhm:
   json_url: "$lhm_json_url"
 
+rtss:
+  shared_memory_name: "RTSSSharedMemoryV2"
+  stale_timeout_ms: 2000
+
 presentmon:
   target_mode: "active_foreground"
   process_name: ""
   process_id: 0
+  executable_path: "$presentmon_final_path"
 
 logging:
   level: "INFO"
@@ -316,51 +397,36 @@ try {
     }
 }
 
-# ========================= STEP 6: PresentMon Check =========================
-Write-Step "6/9" "Checking PresentMon dependencies..."
+# ========================= STEP 6: RTSS / PresentMon Check =========================
+Write-Step "6/9" "Checking RTSS and optional PresentMon fallback..."
 
-try {
-    Write-Info "Checking via winget if Intel.PresentMon is installed..."
-    $pm_installed = & winget list --id Intel.PresentMon 2>&1
-    if (-not ($pm_installed -match "Intel.PresentMon")) {
-        Write-Info "Intel PresentMon not found. Attempting automatic installation via winget..."
-        & winget install -e --id Intel.PresentMon --accept-source-agreements --accept-package-agreements --silent 2>&1 | Out-Null
-    }
-} catch {
-    Write-Info "Winget failed or is unavailable. Proceeding to path check."
-}
-
-$pmFound = $false
-$pmPaths = @(
-    "$env:ProgramFiles\Intel\PresentMonSharedService\PresentMonAPI2.dll",
-    "$env:ProgramFiles\Intel\PresentMon\PresentMonApplication\PresentMonAPI2Loader.dll",
-    "$env:ProgramFiles\PresentMon\PresentMonAPI2.dll",
-    "$env:ProgramFiles\PresentMon\PresentMonAPI.dll",
-    "${env:ProgramFiles(x86)}\PresentMon\PresentMonAPI2.dll",
-    "$env:LOCALAPPDATA\PresentMon\PresentMonAPI2.dll",
-    "$InstallDir\PresentMonAPI2.dll",
-    "$InstallDir\PresentMonAPI.dll"
+$rtssPaths = @(
+    "${env:ProgramFiles(x86)}\RivaTuner Statistics Server\RTSS.exe",
+    "$env:ProgramFiles\RivaTuner Statistics Server\RTSS.exe"
 )
-
-foreach ($p in $pmPaths) {
+foreach ($p in $rtssPaths) {
     if (Test-Path -Path $p) {
-        Write-Ok "PresentMon API found: $p"
-        $pmFound = $true
-        $status.presentmon_detected = $true
+        Write-Ok "RTSS installation found: $p"
+        $status.rtss_detected = $true
         break
     }
 }
 
-if (-not $pmFound) {
-    # Check if PresentMon Service is running
-    $pmService = Get-Service -Name "PresentMon*" -ErrorAction SilentlyContinue
-    if ($pmService) {
-        Write-Ok "PresentMon Service found: $($pmService.DisplayName)"
-        $status.presentmon_detected = $true
-    } else {
-        Write-Fail "PresentMon API/Service not detected."
-        Write-Info "Agent will run without FPS metrics or fallback to generic ETW."
-    }
+$rtssProc = Get-Process -Name "RTSS" -ErrorAction SilentlyContinue
+if ($rtssProc) {
+    Write-Ok "RTSS process is currently running"
+    $status.rtss_detected = $true
+} elseif (-not $status.rtss_detected) {
+    Write-Info "RTSS installation/process not detected. FPS backend will stay configured, but live FPS requires RTSS shared memory to be available."
+}
+
+$pmStandalone = "$BinDir\PresentMon.exe"
+if (Test-Path -Path $pmStandalone) {
+    Write-Ok "Standalone PresentMon fallback found: $pmStandalone"
+    $status.presentmon_detected = $true
+} else {
+    Write-Info "Standalone PresentMon fallback not installed in $pmStandalone"
+    Write-Info "This is optional. RTSS remains the primary FPS backend."
 }
 
 # ========================= STEP 7: InfluxDB Connection Test =========================
@@ -470,7 +536,8 @@ $statusItems = @(
     @("InfluxDB Connectivity", [string]$status.influx_connection),
     @("InfluxDB Write Test", [string]$status.influx_test_write),
     @("LHM Detected (WMI or JSON)", [string]($status.lhm_detected_wmi -or $status.lhm_detected_json)),
-    @("PresentMon Detected", [string]$status.presentmon_detected),
+    @("RTSS Detected", [string]$status.rtss_detected),
+    @("PresentMon Fallback", [string]$status.presentmon_detected),
     @("Scheduled Task Registered", [string]$status.task_registered)
 )
 

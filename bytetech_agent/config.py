@@ -29,9 +29,16 @@ class TimingConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     lhm_enabled: bool = True
     presentmon_enabled: bool = True
+    fps_provider_enabled: Optional[bool] = None
     display_provider_enabled: bool = True
     nvapi_provider_enabled: bool = True
     system_provider_enabled: bool = True
+
+    @property
+    def fps_enabled(self) -> bool:
+        if self.fps_provider_enabled is None:
+            return self.presentmon_enabled
+        return self.fps_provider_enabled
 
 
 class LhmConfig(BaseModel):
@@ -77,6 +84,58 @@ class PresentMonConfig(BaseModel):
         return normalized if normalized > 0 else None
 
 
+class FpsConfig(BaseModel):
+    backend: str = "rtss_shared_memory"
+    fallback_backend: Optional[str] = None
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_backend(cls, value):
+        normalized = str(value or "rtss_shared_memory").strip().lower()
+        aliases = {
+            "rtss": "rtss_shared_memory",
+            "presentmon": "presentmon_console",
+        }
+        normalized = aliases.get(normalized, normalized)
+        allowed = {"rtss_shared_memory", "presentmon_console"}
+        if normalized not in allowed:
+            raise ValueError(f"Unsupported fps.backend: {value!r}")
+        return normalized
+
+    @field_validator("fallback_backend", mode="before")
+    @classmethod
+    def _normalize_fallback_backend(cls, value):
+        if value in (None, "", "none", "null"):
+            return None
+        normalized = str(value).strip().lower()
+        aliases = {
+            "presentmon": "presentmon_console",
+            "rtss": "rtss_shared_memory",
+        }
+        normalized = aliases.get(normalized, normalized)
+        allowed = {"rtss_shared_memory", "presentmon_console"}
+        if normalized not in allowed:
+            raise ValueError(f"Unsupported fps.fallback_backend: {value!r}")
+        return normalized
+
+
+class RtssConfig(BaseModel):
+    shared_memory_name: str = "RTSSSharedMemoryV2"
+    stale_timeout_ms: int = 2000
+
+    @field_validator("shared_memory_name", mode="before")
+    @classmethod
+    def _normalize_shared_memory_name(cls, value):
+        normalized = str(value or "RTSSSharedMemoryV2").strip()
+        return normalized or "RTSSSharedMemoryV2"
+
+    @field_validator("stale_timeout_ms", mode="before")
+    @classmethod
+    def _normalize_stale_timeout_ms(cls, value):
+        normalized = int(value or 2000)
+        return max(250, normalized)
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     log_dir: str = "logs"
@@ -103,7 +162,9 @@ class AppConfig(BaseModel):
     metadata: MetadataConfig
     timing: TimingConfig = Field(default_factory=TimingConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    fps: FpsConfig = Field(default_factory=FpsConfig)
     lhm: LhmConfig = Field(default_factory=LhmConfig)
+    rtss: RtssConfig = Field(default_factory=RtssConfig)
     presentmon: PresentMonConfig = Field(default_factory=PresentMonConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)

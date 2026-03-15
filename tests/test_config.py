@@ -6,11 +6,13 @@ import yaml
 
 from bytetech_agent.config import (
     AppConfig,
+    FpsConfig,
     InfluxConfig,
     MetadataConfig,
     TimingConfig,
     ProvidersConfig,
     PresentMonConfig,
+    RtssConfig,
     LoggingConfig,
     BufferConfig,
     OptionsConfig,
@@ -82,6 +84,7 @@ class TestProvidersConfig:
         cfg = ProvidersConfig()
         assert cfg.lhm_enabled is True
         assert cfg.presentmon_enabled is True
+        assert cfg.fps_enabled is True
         assert cfg.display_provider_enabled is True
         assert cfg.nvapi_provider_enabled is True
         assert cfg.system_provider_enabled is True
@@ -93,6 +96,10 @@ class TestProvidersConfig:
         assert hasattr(cfg, "nvapi_provider_enabled")
         assert hasattr(cfg, "display_provider_enabled")
         assert hasattr(cfg, "system_provider_enabled")
+
+    def test_new_fps_provider_flag_overrides_legacy_presentmon_flag(self):
+        cfg = ProvidersConfig(presentmon_enabled=False, fps_provider_enabled=True)
+        assert cfg.fps_enabled is True
 
 
 class TestBufferConfig:
@@ -118,6 +125,25 @@ class TestPresentMonConfig:
     def test_rejects_invalid_target_mode(self):
         with pytest.raises(Exception):
             PresentMonConfig(target_mode="bad_mode")
+
+
+class TestFpsConfig:
+    def test_defaults(self):
+        cfg = FpsConfig()
+        assert cfg.backend == "rtss_shared_memory"
+        assert cfg.fallback_backend is None
+
+    def test_normalizes_aliases(self):
+        cfg = FpsConfig(backend="rtss", fallback_backend="presentmon")
+        assert cfg.backend == "rtss_shared_memory"
+        assert cfg.fallback_backend == "presentmon_console"
+
+
+class TestRtssConfig:
+    def test_defaults(self):
+        cfg = RtssConfig()
+        assert cfg.shared_memory_name == "RTSSSharedMemoryV2"
+        assert cfg.stale_timeout_ms == 2000
 
 
 class TestOptionsConfig:

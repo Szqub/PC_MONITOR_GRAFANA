@@ -75,7 +75,7 @@ These measurements contain actual telemetry values collected by the underlying p
 - *(Dynamically detected fan RPMs)*
 
 ### `pc_fps`
-**Source:** PresentMon console stdout parser  
+**Source:** RTSS shared memory (primary) or standalone PresentMon console stdout (optional fallback)  
 **Cadence:** `fps_interval` (default 1s)  
 **Note:** Only emitted when an active game/process is detected dynamically.  
 **Tags:** `host`, `process_name`, `pid`, `app_mode`, `backend`  
@@ -86,10 +86,17 @@ These measurements contain actual telemetry values collected by the underlying p
 - `fps_avg_30s` (float)
 - `fps_1pct_30s` (float)
 - `fps_0_1pct_30s` (float)
-- `cpu_busy_ms` (float, optional)
-- `gpu_busy_ms` (float, optional)
-- `display_latency_ms` (float, optional)
-- `present_mode_name` (string, optional safe field name to avoid historical type conflicts with older numeric `present_mode` data)
+- `source_quality` (string, optional)
+- `sample_count_10s` (int, optional)
+- `sample_count_30s` (int, optional)
+- `cpu_busy_ms` (float, optional, PresentMon fallback only)
+- `gpu_busy_ms` (float, optional, PresentMon fallback only)
+- `display_latency_ms` (float, optional, PresentMon fallback only)
+- `present_mode_name` (string, optional, PresentMon fallback only; safe field name to avoid historical type conflicts with older numeric `present_mode` data)
+
+Accuracy note:
+- For RTSS, `fps_1pct_30s` and `fps_0_1pct_30s` are sampled approximations derived from polled RTSS values.
+- They are not benchmark-grade raw percentiles from a full frame-event trace such as ETW/PresentMon raw capture.
 
 ---
 
@@ -155,13 +162,12 @@ from(bucket: "metrics")
   |> filter(fn: (r) => r["host"] == "${host}")
 ```
 
-**Query PresentMon Backend Capability (Is ETW Fallback in use?):**
+**Query FPS Backend Used On Host:**
 ```flux
 from(bucket: "metrics")
-  |> range(start: -5m) // Only need the most recent status
-  |> filter(fn: (r) => r["_measurement"] == "pc_state")
-  |> filter(fn: (r) => r["info_type"] == "provider_health")
-  |> filter(fn: (r) => r["provider"] == "PresentMon")
-  |> filter(fn: (r) => r["_field"] == "cap_cpu_busy_ms") // If false, ETW fallback is active
+  |> range(start: -10m)
+  |> filter(fn: (r) => r["_measurement"] == "pc_fps")
+  |> filter(fn: (r) => r["_field"] == "fps_now")
+  |> filter(fn: (r) => r["host"] == "${host}")
   |> last()
 ```

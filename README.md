@@ -1,14 +1,14 @@
 # ByteTech Agent v1.0
 
-Windows monitoring agent for hardware, system state, and game FPS metrics.
+Windows monitoring agent for hardware, system state, and FPS telemetry.
 
 Architecture:
 
 `Windows Agent -> InfluxDB 2.x -> Grafana`
 
-This repository now uses a production-oriented PresentMon integration based on the standalone `PresentMon.exe` console application launched as a subprocess. The agent reads frame-level records from `stdout`, computes rolling statistics in memory, and writes them directly to InfluxDB measurement `pc_fps`.
-
-CSV files are not used as the production data path and the agent does not depend on `PresentMonSharedService`, `ctypes`, or the Intel PresentMon API V2 bindings.
+The project now uses RTSS shared memory as the primary production FPS backend.
+Standalone PresentMon console remains available only as an optional fallback,
+diagnostic, or benchmark-oriented backend.
 
 ---
 
@@ -20,10 +20,37 @@ ByteTech Agent collects:
 
 - hardware telemetry from LibreHardwareMonitor and NVML
 - system and display state from Windows and `psutil`
-- frame timing and FPS metrics from PresentMon console stdout
+- FPS telemetry from RTSS shared memory
+- optional fallback FPS telemetry from standalone PresentMon console
 - provider and agent health metrics
 
-The default InfluxDB bucket is `metrics`.
+### FPS Backend Architecture
+
+Primary production backend:
+
+- `rtss_shared_memory`
+
+Optional fallback / diagnostics:
+
+- `presentmon_console`
+
+Not used as production path:
+
+- PresentMon Shared Service / API V2
+- CSV files on disk
+- screen scraping / OCR / overlay capture
+
+### Why RTSS Is Now Primary
+
+PresentMon-based live collection was demoted because on the tested host it did not provide reliable production-grade live data. RTSS shared memory is now preferred because it exposes live framerate statistics with low operational complexity.
+
+Trade-off:
+
+- RTSS provides good live telemetry for `fps_now` and `frametime_ms_now`
+- rolling 10s / 30s averages are calculated locally in the agent
+- `fps_1pct_30s` and `fps_0_1pct_30s` are sampled approximations from RTSS polling, not raw frame-event percentiles from a full trace
+
+That limitation is intentional and documented. It is not hidden.
 
 ### Main Measurements
 
@@ -31,29 +58,12 @@ The default InfluxDB bucket is `metrics`.
 |---|---|
 | `pc_hw_raw` | Raw LibreHardwareMonitor sensor values |
 | `pc_hw_curated` | Normalized hardware metrics |
-| `pc_fps` | FPS, frametime, lows, latency, PresentMon backend tags |
+| `pc_fps` | FPS, frametime, sampled lows, backend tags |
 | `pc_state` | System, display, provider health, agent health |
 
-### PresentMon FPS Provider
+### `pc_fps` Schema
 
-The FPS provider is implemented in [bytetech_agent/providers/presentmon_provider.py](C:\Users\Firell\.gemini\antigravity\scratch\PC_MONITOR_GRAFANA\bytetech_agent\providers\presentmon_provider.py).
-
-Production path:
-
-1. Resolve the current target process.
-2. Launch `PresentMon.exe` as a subprocess.
-3. Stream CSV rows from `stdout`.
-4. Parse frame-level records in Python.
-5. Maintain rolling 1s, 10s, and 30s windows in memory per process.
-6. Emit one `pc_fps` metric per collection cycle.
-
-Supported target modes:
-
-- `active_foreground`
-- `explicit_process_name`
-- `explicit_process_id`
-
-Tags written to `pc_fps`:
+Required tags:
 
 - `host`
 - `process_name`
@@ -61,11 +71,7 @@ Tags written to `pc_fps`:
 - `app_mode`
 - `backend`
 
-Current backend tag value:
-
-- `presentmon_console_stdout`
-
-Fields written to `pc_fps`:
+Required fields:
 
 - `fps_now`
 - `frametime_ms_now`
@@ -73,97 +79,110 @@ Fields written to `pc_fps`:
 - `fps_avg_30s`
 - `fps_1pct_30s`
 - `fps_0_1pct_30s`
-- `cpu_busy_ms` when available
-- `gpu_busy_ms` when available
-- `display_latency_ms` when available
-- `present_mode_name` when available
 
-### Important PresentMon Notes
+Optional fields:
 
-- The agent no longer uses `PresentMonSharedService` or API V2 through `ctypes`.
-- The agent uses `--output_stdout` and reads PresentMon output directly from the child process stream.
-- In PresentMon itself, `--output_stdout` and `--no_csv` are mutually exclusive. Because of that, the agent uses `stdout` streaming and does not write CSV files to disk.
-- On some Windows hosts, `PresentMon.exe` requires elevation. If so, run the agent from an elevated scheduled task, service, or administrator console.
+- `present_mode_name`
+- `source_quality`
+- `sample_count_10s`
+- `sample_count_30s`
 
-### PresentMon Configuration
+Current backend tag values:
 
-Configuration model:
+- `rtss_shared_memory`
+- `presentmon_console_stdout`
+
+### Configuration
 
 ```yaml
+fps:
+  backend: "rtss_shared_memory"
+  fallback_backend: ""
+
+rtss:
+  shared_memory_name: "RTSSSharedMemoryV2"
+  stale_timeout_ms: 2000
+
 presentmon:
   target_mode: "active_foreground"
   process_name: ""
   process_id: 0
-  executable_path: "C:\\Program Files\\Intel\\PresentMon\\PresentMonApplication\\PresentMon.exe"
+  executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
 ```
 
 Notes:
 
-- `executable_path` is optional.
-- If `executable_path` is omitted, the agent tries known locations such as `C:\Program Files\Intel\PresentMon\PresentMonApplication\PresentMon.exe`.
-- `process_name` is used only in `explicit_process_name`.
-- `process_id` is used in `explicit_process_id` or `explicit_pid`.
+- default backend is `rtss_shared_memory`
+- `fallback_backend` is optional and can be `presentmon_console`
+- `active_foreground` remains the default production target mode
+- `explicit_process_name` and `explicit_process_id` remain diagnostic modes
 
-### Installation
+### RTSS Requirements
 
-Requirements:
+RTSS must:
 
-- Windows 10/11 x64
-- Python 3.10+
-- InfluxDB 2.x
-- LibreHardwareMonitor for hardware telemetry
-- PresentMon for FPS telemetry
-- NVIDIA GPU is optional for NVML metrics
+- be installed or bundled on the host
+- be running
+- expose shared memory
 
-Install dependencies:
+If RTSS shared memory is not available:
 
-```powershell
-pip install -r requirements.txt
-```
+- the agent does not crash
+- the RTSS provider logs a precise technical message
+- if `fallback_backend` is configured, the router may try PresentMon console
+- otherwise no FPS metric is emitted for that cycle
 
-Run the agent:
+### PresentMon Fallback Rules
 
-```powershell
-python -m bytetech_agent
-```
+PresentMon console is no longer the recommended primary backend.
 
-Run the installer:
+Use it only for:
 
-```powershell
-.\install\install.ps1
-```
+- fallback
+- diagnostics
+- controlled benchmark runs
+
+Do not use this GUI path as the default or recommended executable:
+
+- `C:\Program Files\Intel\PresentMon\PresentMonApplication\PresentMon.exe`
+
+The project expects a standalone console executable, preferably:
+
+- `C:\ByteTechAgent\bin\PresentMon.exe`
+
+If a GUI `PresentMonApplication` path is configured, the provider logs a clear error and rejects it.
+
+### Installer Behavior
+
+The installer now assumes:
+
+- RTSS is the default FPS backend
+- standalone PresentMon is optional
+- standalone PresentMon should live at `C:\ByteTechAgent\bin\PresentMon.exe`
+
+If PresentMon fallback is enabled, the installer:
+
+- checks whether `C:\ByteTechAgent\bin\PresentMon.exe` exists
+- asks the user for a standalone executable path or allows file browse
+- can copy the selected executable into `C:\ByteTechAgent\bin\PresentMon.exe`
+- stores the final path in config
 
 ### Diagnostics
 
-The stdout probe tool is implemented in [bytetech_agent/tools/presentmon_stdout_probe.py](C:\Users\Firell\.gemini\antigravity\scratch\PC_MONITOR_GRAFANA\bytetech_agent\tools\presentmon_stdout_probe.py).
-
-Examples:
+PresentMon stdout probe:
 
 ```powershell
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-name dwm.exe --duration 5
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-id 1234 --duration 5
 ```
 
-The probe:
+RTSS diagnosis checklist:
 
-- resolves `PresentMon.exe`
-- prints the exact launch command
-- shows the first stdout lines
-- runs the same CSV parser used by the agent
-- reports whether non-zero frame-level records were parsed
-
-### Logging
-
-The PresentMon provider logs:
-
-- exact launch command
-- subprocess PID
-- process target switches
-- first stdout and stderr lines after startup
-- frame-level processed record counts
-- computed fields before `MetricData` creation
-- reasons for zero-valued output
-- parser errors without crashing the agent
+1. Start RTSS.
+2. Start a game or target process.
+3. Verify RTSS OSD/shared memory support is available.
+4. Run the agent.
+5. Check logs for backend tag and RTSS shared memory availability.
 
 ### Testing
 
@@ -173,24 +192,31 @@ Run all tests:
 pytest -q
 ```
 
-Run only PresentMon-related tests:
+RTSS/FPS specific tests:
 
 ```powershell
-pytest -q tests\test_presentmon_provider.py
+pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\test_config.py
 ```
 
-### Operational Behavior
+### Troubleshooting
 
-- If no foreground target exists, the agent emits legal zero values for `pc_fps`.
-- If the target process is not rendering, the agent emits zeros instead of crashing or dropping the whole write batch.
-- If the foreground game changes, the provider restarts PresentMon only when necessary.
-- The provider performs clean shutdown and avoids zombie child processes.
+No FPS in Grafana:
 
-### Known Limitations
+1. Check `backend` tag in `pc_fps`.
+2. Confirm RTSS is running.
+3. Confirm RTSS shared memory is available.
+4. Confirm the game is the active foreground target when using `active_foreground`.
+5. If using PresentMon fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
 
-- Live validation still depends on the local host allowing `PresentMon.exe` to run.
-- Some hosts require administrator privileges for PresentMon capture.
-- If multiple processes share the same executable name in `explicit_process_name`, the provider uses the freshest active sample set.
+Example Flux check:
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r["_measurement"] == "pc_fps")
+  |> filter(fn: (r) => r["_field"] == "fps_now")
+  |> filter(fn: (r) => r["backend"] == "rtss_shared_memory" or r["backend"] == "presentmon_console_stdout")
+```
 
 ---
 
@@ -202,40 +228,41 @@ ByteTech Agent zbiera:
 
 - telemetrię sprzętową z LibreHardwareMonitor i NVML
 - stan systemu i ekranów z Windows oraz `psutil`
-- metryki FPS i frametime z PresentMon uruchamianego jako osobny proces
+- telemetrię FPS z RTSS shared memory
+- opcjonalne FPS z fallbacku standalone PresentMon console
 - metryki zdrowia providera i całego agenta
 
-Domyślny bucket InfluxDB to `metrics`.
+### Architektura backendu FPS
 
-### Główne measurementy
+Główny backend produkcyjny:
 
-| Measurement | Przeznaczenie |
-|---|---|
-| `pc_hw_raw` | Surowe sensory LibreHardwareMonitor |
-| `pc_hw_curated` | Znormalizowane metryki sprzętowe |
-| `pc_fps` | FPS, frametime, lows, latency i tagi backendu PresentMon |
-| `pc_state` | Stan systemu, ekranów, providerów i zdrowia agenta |
+- `rtss_shared_memory`
 
-### Provider FPS oparty o PresentMon
+Opcjonalny fallback / diagnostyka:
 
-Provider FPS jest zaimplementowany w [bytetech_agent/providers/presentmon_provider.py](C:\Users\Firell\.gemini\antigravity\scratch\PC_MONITOR_GRAFANA\bytetech_agent\providers\presentmon_provider.py).
+- `presentmon_console`
 
-Ścieżka produkcyjna działa tak:
+Nie używamy jako ścieżki produkcyjnej:
 
-1. Agent wyznacza aktualny proces docelowy.
-2. Uruchamia `PresentMon.exe` jako subprocess.
-3. Czyta strumieniowo rekordy CSV ze `stdout`.
-4. Parsuje rekordy frame-level w Pythonie.
-5. Utrzymuje rolling windows 1s, 10s i 30s w pamięci, osobno dla procesu.
-6. W każdej iteracji emituje pojedynczy rekord `pc_fps`.
+- PresentMon Shared Service / API V2
+- CSV na dysku
+- screen scrapingu / OCR / overlay capture
 
-Obsługiwane tryby targetowania:
+### Dlaczego RTSS jest teraz primary
 
-- `active_foreground`
-- `explicit_process_name`
-- `explicit_process_id`
+Backendy oparte o PresentMon zostały zdegradowane, bo na hoście testowym nie dawały wiarygodnych danych live do produkcyjnego monitoringu. RTSS shared memory jest teraz preferowane, bo daje prostsze i stabilniejsze live telemetry.
 
-Tagi zapisywane do `pc_fps`:
+Świadomy kompromis:
+
+- RTSS dobrze nadaje się do `fps_now` i `frametime_ms_now`
+- rolling 10s / 30s liczymy lokalnie w agencie
+- `fps_1pct_30s` i `fps_0_1pct_30s` są sampled approximations z próbek RTSS, a nie surowymi percentylami z pełnego frame trace
+
+To ograniczenie jest jawne i udokumentowane.
+
+### Schema `pc_fps`
+
+Wymagane tagi:
 
 - `host`
 - `process_name`
@@ -243,11 +270,7 @@ Tagi zapisywane do `pc_fps`:
 - `app_mode`
 - `backend`
 
-Aktualna wartość taga `backend`:
-
-- `presentmon_console_stdout`
-
-Pola zapisywane do `pc_fps`:
+Wymagane pola:
 
 - `fps_now`
 - `frametime_ms_now`
@@ -255,121 +278,139 @@ Pola zapisywane do `pc_fps`:
 - `fps_avg_30s`
 - `fps_1pct_30s`
 - `fps_0_1pct_30s`
-- `cpu_busy_ms` jeśli dostępne
-- `gpu_busy_ms` jeśli dostępne
-- `display_latency_ms` jeśli dostępne
-- `present_mode_name` jeśli dostępne
 
-### Ważne uwagi o PresentMon
+Pola opcjonalne:
 
-- Agent nie używa już `PresentMonSharedService` ani API V2 przez `ctypes`.
-- Agent używa `--output_stdout` i czyta dane bezpośrednio ze strumienia procesu potomnego.
-- W samym PresentMon flagi `--output_stdout` i `--no_csv` są wzajemnie wykluczające. Dlatego agent używa streamingu po `stdout` i nie zapisuje CSV na dysk.
-- Na części hostów Windows `PresentMon.exe` wymaga podniesionych uprawnień. W takiej sytuacji uruchamiaj agenta jako zadanie z uprawnieniami administratora, usługę lub z podniesionej konsoli.
+- `present_mode_name`
+- `source_quality`
+- `sample_count_10s`
+- `sample_count_30s`
 
-### Konfiguracja PresentMon
+Aktualne wartości taga `backend`:
 
-Model konfiguracji:
+- `rtss_shared_memory`
+- `presentmon_console_stdout`
+
+### Konfiguracja
 
 ```yaml
+fps:
+  backend: "rtss_shared_memory"
+  fallback_backend: ""
+
+rtss:
+  shared_memory_name: "RTSSSharedMemoryV2"
+  stale_timeout_ms: 2000
+
 presentmon:
   target_mode: "active_foreground"
   process_name: ""
   process_id: 0
-  executable_path: "C:\\Program Files\\Intel\\PresentMon\\PresentMonApplication\\PresentMon.exe"
+  executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
 ```
 
 Uwagi:
 
-- `executable_path` jest opcjonalne.
-- Jeśli `executable_path` nie jest ustawione, agent szuka `PresentMon.exe` w znanych lokalizacjach, między innymi w `C:\Program Files\Intel\PresentMon\PresentMonApplication\PresentMon.exe`.
-- `process_name` jest używane tylko w trybie `explicit_process_name`.
-- `process_id` jest używane w trybie `explicit_process_id` lub `explicit_pid`.
+- domyślny backend to `rtss_shared_memory`
+- `fallback_backend` jest opcjonalny i może mieć wartość `presentmon_console`
+- `active_foreground` pozostaje domyślnym trybem produkcyjnym
+- `explicit_process_name` i `explicit_process_id` pozostają trybami diagnostycznymi
 
-### Instalacja
+### Wymagania dla RTSS
 
-Wymagania:
+RTSS musi:
 
-- Windows 10/11 x64
-- Python 3.10+
-- InfluxDB 2.x
-- LibreHardwareMonitor dla metryk sprzętowych
-- PresentMon dla metryk FPS
-- karta NVIDIA jest opcjonalna dla metryk NVML
+- być zainstalowany albo dostarczony na hoście
+- być uruchomiony
+- udostępniać shared memory
 
-Instalacja zależności:
+Jeżeli RTSS shared memory nie jest dostępne:
 
-```powershell
-pip install -r requirements.txt
-```
+- agent nie crashuje
+- provider RTSS loguje precyzyjny techniczny komunikat
+- jeśli skonfigurowano `fallback_backend`, router może spróbować PresentMon console
+- w przeciwnym razie w tej iteracji nie powstaje `pc_fps`
 
-Uruchomienie agenta:
+### Zasady dla fallbacku PresentMon
 
-```powershell
-python -m bytetech_agent
-```
+PresentMon console nie jest już zalecanym primary backendem.
 
-Uruchomienie instalatora:
+Używaj go tylko do:
 
-```powershell
-.\install\install.ps1
-```
+- fallbacku
+- diagnostyki
+- kontrolowanych benchmarków
+
+Nie używaj tej ścieżki GUI jako domyślnej ani zalecanej:
+
+- `C:\Program Files\Intel\PresentMon\PresentMonApplication\PresentMon.exe`
+
+Projekt oczekuje standalone console executable, najlepiej:
+
+- `C:\ByteTechAgent\bin\PresentMon.exe`
+
+Jeśli w configu pojawi się ścieżka do GUI `PresentMonApplication`, provider zgłosi czytelny błąd i ją odrzuci.
+
+### Zachowanie instalatora
+
+Instalator zakłada teraz, że:
+
+- RTSS jest domyślnym backendem FPS
+- standalone PresentMon jest opcjonalny
+- standalone PresentMon powinien trafić do `C:\ByteTechAgent\bin\PresentMon.exe`
+
+Jeżeli włączysz fallback PresentMon, instalator:
+
+- sprawdzi istnienie `C:\ByteTechAgent\bin\PresentMon.exe`
+- poprosi o ścieżkę do standalone executable albo pozwoli wskazać plik przez browse dialog
+- może skopiować wskazany plik do `C:\ByteTechAgent\bin\PresentMon.exe`
+- zapisze finalną ścieżkę do configa
 
 ### Diagnostyka
 
-Narzędzie diagnostyczne stdout probe znajduje się w [bytetech_agent/tools/presentmon_stdout_probe.py](C:\Users\Firell\.gemini\antigravity\scratch\PC_MONITOR_GRAFANA\bytetech_agent\tools\presentmon_stdout_probe.py).
-
-Przykłady:
+Probe dla PresentMon stdout:
 
 ```powershell
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-name dwm.exe --duration 5
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-id 1234 --duration 5
 ```
 
-Probe:
+Checklist dla RTSS:
 
-- lokalizuje `PresentMon.exe`
-- wypisuje dokładną komendę uruchomienia
-- pokazuje pierwsze linie `stdout`
-- używa tego samego parsera CSV co agent
-- raportuje, czy udało się sparsować niezerowe rekordy frame-level
-
-### Logowanie
-
-Provider PresentMon loguje:
-
-- dokładną komendę startową
-- PID subprocessa
-- przełączenia targetu procesu
-- pierwsze linie `stdout` i `stderr` po starcie
-- liczbę przetworzonych rekordów frame-level
-- wyliczone pola przed utworzeniem `MetricData`
-- przyczyny wysłania zer
-- błędy parsera bez wywracania całego agenta
+1. Uruchom RTSS.
+2. Uruchom grę albo proces docelowy.
+3. Upewnij się, że RTSS udostępnia shared memory.
+4. Uruchom agenta.
+5. Sprawdź logi pod kątem dostępności RTSS i taga `backend`.
 
 ### Testy
 
-Uruchomienie wszystkich testów:
+Wszystkie testy:
 
 ```powershell
 pytest -q
 ```
 
-Uruchomienie testów PresentMon:
+Testy RTSS/FPS:
 
 ```powershell
-pytest -q tests\test_presentmon_provider.py
+pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\test_config.py
 ```
 
-### Zachowanie operacyjne
+### Diagnoza braku FPS
 
-- Jeśli nie ma aktywnego procesu docelowego, agent emituje poprawne zera dla `pc_fps`.
-- Jeśli proces docelowy nie renderuje, agent wysyła zera zamiast crashować lub gubić cały batch do InfluxDB.
-- Jeśli zmienia się aktywna gra na foregroundzie, provider restartuje PresentMon tylko wtedy, gdy to konieczne.
-- Provider wykonuje clean shutdown i nie zostawia zombie processów.
+1. Sprawdź tag `backend` w `pc_fps`.
+2. Potwierdź, że RTSS działa.
+3. Potwierdź, że RTSS shared memory jest dostępne.
+4. Przy `active_foreground` upewnij się, że gra jest faktycznie aktywnym oknem.
+5. Przy fallbacku PresentMon upewnij się, że ścieżka wskazuje standalone console executable, a nie GUI `PresentMonApplication`.
 
-### Znane ograniczenia
+Przykładowe zapytanie Flux:
 
-- Walidacja live nadal zależy od tego, czy dany host pozwala uruchomić `PresentMon.exe`.
-- Na części hostów do capture z PresentMon potrzebne są uprawnienia administratora.
-- Jeśli kilka procesów ma tę samą nazwę w trybie `explicit_process_name`, provider wybiera najświeższy aktywny zestaw próbek.
+```flux
+from(bucket: "metrics")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r["_measurement"] == "pc_fps")
+  |> filter(fn: (r) => r["_field"] == "fps_now")
+  |> filter(fn: (r) => r["backend"] == "rtss_shared_memory" or r["backend"] == "presentmon_console_stdout")
+```

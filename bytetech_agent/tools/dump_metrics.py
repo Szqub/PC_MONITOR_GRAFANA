@@ -13,7 +13,7 @@ from bytetech_agent.normalizers.influx_formatter import InfluxFormatter
 
 # Providers
 from bytetech_agent.providers.lhm_provider import LhmProvider
-from bytetech_agent.providers.presentmon_provider import PresentMonProvider
+from bytetech_agent.providers.fps_provider import FpsProvider
 from bytetech_agent.providers.display_provider import DisplayProvider
 from bytetech_agent.providers.nvapi_provider import NvapiProvider
 from bytetech_agent.providers.system_provider import SystemProvider
@@ -48,8 +48,8 @@ def dump_schema():
     if config.providers.nvapi_provider_enabled:
         providers.append(NvapiProvider())
         
-    if config.providers.presentmon_enabled:
-        providers.append(PresentMonProvider(config.presentmon))
+    if config.providers.fps_enabled:
+        providers.append(FpsProvider(config.fps, config.rtss, config.presentmon))
         
     if config.providers.display_provider_enabled:
         providers.append(DisplayProvider())

@@ -297,7 +297,7 @@ class PresentMonProvider(BaseProvider):
         if not self._exe_path:
             self._health.mark_unavailable("PresentMon.exe not found.")
             logger.warning(
-                "PresentMon Provider unavailable: PresentMon.exe not found in known locations."
+                "PresentMon Provider unavailable: standalone PresentMon console executable not found."
             )
             return False
 
@@ -328,24 +328,38 @@ class PresentMonProvider(BaseProvider):
 
     def _discover_presentmon_exe(self) -> Optional[str]:
         configured_path = getattr(self.config, "executable_path", None)
+        if configured_path:
+            if os.path.isfile(configured_path) and self._is_gui_presentmon_path(configured_path):
+                logger.error(
+                    "Configured PresentMon executable points to GUI PresentMonApplication build, "
+                    "which is not supported as fallback executable: %s",
+                    configured_path,
+                )
+                return None
+
         candidates = [
             configured_path,
             os.environ.get("PRESENTMON_EXE"),
-            os.path.join(
-                os.environ.get("ProgramFiles", ""),
-                "Intel",
-                "PresentMon",
-                "PresentMonApplication",
-                "PresentMon.exe",
-            ),
+            os.path.join("C:\\ByteTechAgent", "bin", "PresentMon.exe"),
             os.path.join(os.environ.get("ProgramFiles", ""), "PresentMon", "PresentMon.exe"),
             os.path.join(os.getcwd(), "PresentMon.exe"),
             shutil.which("PresentMon.exe"),
         ]
         for candidate in candidates:
             if candidate and os.path.isfile(candidate):
+                if self._is_gui_presentmon_path(candidate):
+                    logger.error(
+                        "PresentMon executable path points to GUI PresentMonApplication build, "
+                        "which is not supported as fallback executable: %s",
+                        candidate,
+                    )
+                    continue
                 return candidate
         return None
+
+    def _is_gui_presentmon_path(self, path: str) -> bool:
+        normalized = os.path.normcase(os.path.abspath(path))
+        return "presentmonapplication" in normalized
 
     def _resolve_target(self) -> Optional[PresentMonTarget]:
         target_mode = (self.config.target_mode or "active_foreground").strip().lower()

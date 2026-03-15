@@ -19,7 +19,7 @@ from bytetech_agent.providers.base import BaseProvider
 
 # Providers
 from bytetech_agent.providers.lhm_provider import LhmProvider
-from bytetech_agent.providers.presentmon_provider import PresentMonProvider
+from bytetech_agent.providers.fps_provider import FpsProvider
 from bytetech_agent.providers.display_provider import DisplayProvider
 from bytetech_agent.providers.nvapi_provider import NvapiProvider
 from bytetech_agent.providers.system_provider import SystemProvider
@@ -73,8 +73,8 @@ class AgentScheduler:
         if config.providers.nvapi_provider_enabled:
             self._hw_providers.append(NvapiProvider())
 
-        if config.providers.presentmon_enabled:
-            self._fps_providers.append(PresentMonProvider(config.presentmon))
+        if config.providers.fps_enabled:
+            self._fps_providers.append(FpsProvider(config.fps, config.rtss, config.presentmon))
 
         if config.providers.display_provider_enabled:
             self._state_providers.append(DisplayProvider())

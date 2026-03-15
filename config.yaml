@@ -16,9 +16,14 @@ timing:
   hw_interval_sec: 2
   fps_interval_sec: 1
 
+fps:
+  backend: "rtss_shared_memory"
+  fallback_backend: ""
+
 providers:
   lhm_enabled: true
   presentmon_enabled: true
+  fps_provider_enabled: true
   display_provider_enabled: true
   nvapi_provider_enabled: true
   system_provider_enabled: true
@@ -28,6 +33,10 @@ lhm:
   # LibreHardwareMonitor exposes data at http://127.0.0.1:8085/data.json
   json_url: "http://127.0.0.1:8085"
 
+rtss:
+  shared_memory_name: "RTSSSharedMemoryV2"
+  stale_timeout_ms: 2000
+
 presentmon:
   # valid values:
   # - active_foreground
@@ -36,7 +45,7 @@ presentmon:
   target_mode: "active_foreground"
   process_name: ""
   process_id: 0
-  executable_path: ""
+  executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
 
 logging:
   level: "INFO"
