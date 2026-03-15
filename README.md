@@ -187,6 +187,8 @@ RTSS raw shared-memory probe:
 ```powershell
 python -m bytetech_agent.tools.rtss_probe
 python -m bytetech_agent.tools.rtss_probe --shared-memory-name RTSSSharedMemoryV2 --stale-timeout-ms 2000
+python -m bytetech_agent.tools.rtss_probe --inspect-entry-index 11
+python -m bytetech_agent.tools.rtss_probe --inspect-pid 48420
 ```
 
 RTSS diagnosis checklist:
@@ -407,6 +409,8 @@ Surowy probe RTSS shared memory:
 ```powershell
 python -m bytetech_agent.tools.rtss_probe
 python -m bytetech_agent.tools.rtss_probe --shared-memory-name RTSSSharedMemoryV2 --stale-timeout-ms 2000
+python -m bytetech_agent.tools.rtss_probe --inspect-entry-index 11
+python -m bytetech_agent.tools.rtss_probe --inspect-pid 48420
 ```
 
 Checklist dla RTSS:

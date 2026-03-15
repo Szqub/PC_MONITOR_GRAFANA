@@ -39,7 +39,8 @@ def _make_rtss_buffer(pid=4242, process_name="game.exe", framerate_tenths=600):
     entry.dwTime0 = (current_tick_ms - 500) & 0xFFFFFFFF
     entry.dwTime1 = current_tick_ms
     entry.dwFrames = 30
-    entry.dwStatFrameTimeBufFramerate = framerate_tenths
+    entry.dwFrameTime = int(1_000_000 / (framerate_tenths / 10.0))
+    entry.dwStatFramerateAvg = int(framerate_tenths / 10.0)
 
     total_size = ctypes.sizeof(header) + ctypes.sizeof(entry)
     blob = ctypes.create_string_buffer(total_size)
@@ -75,7 +76,8 @@ def _make_live_rtss_v2_buffer():
     entry.dwTime0 = (current_tick_ms - 500) & 0xFFFFFFFF
     entry.dwTime1 = current_tick_ms
     entry.dwFrames = 30
-    entry.dwStatFrameTimeBufFramerate = 600
+    entry.dwFrameTime = 16667
+    entry.dwStatFramerateAvg = 60
     ctypes.memmove(
         ctypes.addressof(blob) + header.dwAppArrOffset,
         ctypes.addressof(entry),
@@ -205,7 +207,9 @@ def test_rtss_probe_renderer_outputs_entry_decision_and_raw_fields():
                         age_ms=12,
                         kept=False,
                         reject_reason="zero_fps",
-                        raw_fields={"dwFrames": 30, "dwStatFrameTimeBufFramerate": 600},
+                        raw_fields={"dwFrames": 30, "dwStatFramerateAvg": 60},
+                        field_offsets={"dwFrames": 0x110, "legacy_dwFrames": 0x214},
+                        hexdumps={"current_stat_region": "+0x0100: 00 00", "legacy_guess_region": "+0x0200: 00 00"},
                     )
                 ],
             )
@@ -215,7 +219,9 @@ def test_rtss_probe_renderer_outputs_entry_decision_and_raw_fields():
     assert "mapping=RTSSSharedMemoryV2" in rendered
     assert "decision=rejected" in rendered
     assert "reason=zero_fps" in rendered
-    assert "raw_fields dwFrames=30 dwStatFrameTimeBufFramerate=600" in rendered
+    assert "raw_fields dwFrames=30 dwStatFramerateAvg=60" in rendered
+    assert "field_offsets dwFrames=0x110 legacy_dwFrames=0x214" in rendered
+    assert "hexdump[current_stat_region]" in rendered
 
 
 class StubMetricsProvider(BaseProvider):

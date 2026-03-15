@@ -81,6 +81,26 @@ class RTSSSharedMemoryAppEntryPrefix(ctypes.Structure):
     _fields_ = [
         ("dwProcessID", ctypes.c_uint32),
         ("szProcessName", ctypes.c_char * MAX_PATH_CHARS),
+        ("dwFlags", ctypes.c_uint32),
+        ("dwTime0", ctypes.c_uint32),
+        ("dwTime1", ctypes.c_uint32),
+        ("dwFrames", ctypes.c_uint32),
+        ("dwFrameTime", ctypes.c_uint32),
+        ("dwStatFlags", ctypes.c_uint32),
+        ("dwStatTime0", ctypes.c_uint32),
+        ("dwStatTime1", ctypes.c_uint32),
+        ("dwStatFrames", ctypes.c_uint32),
+        ("dwStatCount", ctypes.c_uint32),
+        ("dwStatFramerateMin", ctypes.c_uint32),
+        ("dwStatFramerateAvg", ctypes.c_uint32),
+        ("dwStatFramerateMax", ctypes.c_uint32),
+    ]
+
+
+class RTSSSharedMemoryAppEntryLegacyGuess(ctypes.Structure):
+    _fields_ = [
+        ("dwProcessID", ctypes.c_uint32),
+        ("szProcessName", ctypes.c_char * MAX_PATH_CHARS),
         ("szProfileName", ctypes.c_char * MAX_PATH_CHARS),
         ("dwFlags", ctypes.c_uint32),
         ("dwTime0", ctypes.c_uint32),
@@ -172,6 +192,8 @@ class RtssEntryDiagnostic:
     kept: bool
     reject_reason: Optional[str]
     raw_fields: Dict[str, int]
+    field_offsets: Dict[str, int]
+    hexdumps: Dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -326,8 +348,15 @@ class RtssSharedMemoryReader:
             entry_diagnostics=[],
         )
 
-    def probe_mappings(self) -> List[RtssProbeResult]:
-        return [self._probe_mapping(mapping_name) for mapping_name in self._candidate_mapping_names()]
+    def probe_mappings(
+        self,
+        inspect_entry_index: Optional[int] = None,
+        inspect_pid: Optional[int] = None,
+    ) -> List[RtssProbeResult]:
+        return [
+            self._probe_mapping(mapping_name, inspect_entry_index=inspect_entry_index, inspect_pid=inspect_pid)
+            for mapping_name in self._candidate_mapping_names()
+        ]
 
     def _candidate_mapping_names(self) -> List[str]:
         base_names = [
@@ -348,7 +377,12 @@ class RtssSharedMemoryReader:
                 seen.append(candidate)
         return seen
 
-    def _probe_mapping(self, mapping_name: str) -> RtssProbeResult:
+    def _probe_mapping(
+        self,
+        mapping_name: str,
+        inspect_entry_index: Optional[int] = None,
+        inspect_pid: Optional[int] = None,
+    ) -> RtssProbeResult:
         mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, mapping_name)
         if not mapping:
             return RtssProbeResult(
@@ -376,7 +410,13 @@ class RtssSharedMemoryReader:
 
         try:
             mapping_size = self._query_view_region_size(view)
-            result = self._parse_view(view, mapping_name, mapping_size)
+            result = self._parse_view(
+                view,
+                mapping_name,
+                mapping_size,
+                inspect_entry_index=inspect_entry_index,
+                inspect_pid=inspect_pid,
+            )
             if result.status != "ok":
                 self._log_debug_once(
                     "RTSS mapping '%s' opened but parse failed: %s",
@@ -388,7 +428,14 @@ class RtssSharedMemoryReader:
             kernel32.UnmapViewOfFile(view)
             kernel32.CloseHandle(mapping)
 
-    def _parse_view(self, view: int, mapping_name: str, mapping_size: int = 0) -> RtssProbeResult:
+    def _parse_view(
+        self,
+        view: int,
+        mapping_name: str,
+        mapping_size: int = 0,
+        inspect_entry_index: Optional[int] = None,
+        inspect_pid: Optional[int] = None,
+    ) -> RtssProbeResult:
         header = RTSSSharedMemoryHeader.from_address(view)
         header_info = RtssHeaderInfo(
             signature=header.dwSignature,
@@ -450,10 +497,10 @@ class RtssSharedMemoryReader:
         for index in range(header.dwAppArrSize):
             entry_address = view + header.dwAppArrOffset + index * header.dwAppEntrySize
             entry = RTSSSharedMemoryAppEntryPrefix.from_address(entry_address)
+            legacy_entry = RTSSSharedMemoryAppEntryLegacyGuess.from_address(entry_address)
             process_name = self._decode_c_string(entry.szProcessName)
-            profile_name = self._decode_c_string(entry.szProfileName)
             fps, source_quality = self._extract_fps(header.dwVersion, entry)
-            frametime_ms = round(1000.0 / fps, 2) if fps > 0 else 0.0
+            frametime_ms = self._extract_frametime_ms(entry, fps)
             age_ms = self._compute_age_ms(current_tick_ms, entry.dwTime1)
             reject_reason = self._classify_entry_rejection(
                 pid=entry.dwProcessID,
@@ -461,12 +508,16 @@ class RtssSharedMemoryReader:
                 fps=fps,
                 age_ms=age_ms,
             )
+            include_detail = (inspect_entry_index is not None and inspect_entry_index == index) or (
+                inspect_pid is not None and inspect_pid == entry.dwProcessID
+            )
+            hexdumps = self._build_entry_hexdumps(entry_address, header.dwAppEntrySize) if include_detail else {}
             entry_diagnostics.append(
                 RtssEntryDiagnostic(
                     index=index,
                     pid=entry.dwProcessID,
                     process_name=process_name,
-                    profile_name=profile_name,
+                    profile_name="",
                     fps=round(fps, 2),
                     frametime_ms=frametime_ms,
                     source_quality=source_quality,
@@ -485,10 +536,25 @@ class RtssSharedMemoryReader:
                         "dwStatTime1": entry.dwStatTime1,
                         "dwStatFrames": entry.dwStatFrames,
                         "dwStatCount": entry.dwStatCount,
-                        "dwStatFramerate": entry.dwStatFramerate,
-                        "dwStatFrameTime": entry.dwStatFrameTime,
-                        "dwStatFrameTimeBufFramerate": entry.dwStatFrameTimeBufFramerate,
+                        "dwStatFramerateMin": entry.dwStatFramerateMin,
+                        "dwStatFramerateAvg": entry.dwStatFramerateAvg,
+                        "dwStatFramerateMax": entry.dwStatFramerateMax,
+                        "legacy_dwFlags": legacy_entry.dwFlags,
+                        "legacy_dwTime0": legacy_entry.dwTime0,
+                        "legacy_dwTime1": legacy_entry.dwTime1,
+                        "legacy_dwFrames": legacy_entry.dwFrames,
+                        "legacy_dwFrameTime": legacy_entry.dwFrameTime,
+                        "legacy_dwStatFlags": legacy_entry.dwStatFlags,
+                        "legacy_dwStatTime0": legacy_entry.dwStatTime0,
+                        "legacy_dwStatTime1": legacy_entry.dwStatTime1,
+                        "legacy_dwStatFrames": legacy_entry.dwStatFrames,
+                        "legacy_dwStatCount": legacy_entry.dwStatCount,
+                        "legacy_dwStatFramerate": legacy_entry.dwStatFramerate,
+                        "legacy_dwStatFrameTime": legacy_entry.dwStatFrameTime,
+                        "legacy_dwStatFrameTimeBufFramerate": legacy_entry.dwStatFrameTimeBufFramerate,
                     },
+                    field_offsets=self._field_offsets(),
+                    hexdumps=hexdumps,
                 )
             )
 
@@ -523,15 +589,30 @@ class RtssSharedMemoryReader:
         return bytes(buffer).split(b"\0", 1)[0].decode("utf-8", errors="ignore").strip()
 
     def _extract_fps(self, version: int, entry: RTSSSharedMemoryAppEntryPrefix) -> tuple[float, str]:
-        if version >= RTSS_RING_BUFFER_VERSION and entry.dwStatFrameTimeBufFramerate > 0:
-            return entry.dwStatFrameTimeBufFramerate / 10.0, "rtss_ring_buffer_sampled"
+        if entry.dwFrameTime > 0:
+            return 1_000_000.0 / entry.dwFrameTime, "rtss_frame_time_instant"
 
         delta_ms = (entry.dwTime1 - entry.dwTime0) & 0xFFFFFFFF
         if delta_ms > 0 and entry.dwFrames > 0:
             fps = entry.dwFrames * 1000.0 / delta_ms
             return fps, "rtss_frame_counter_sampled"
 
+        if entry.dwStatFramerateAvg > 0:
+            return self._normalize_stat_fps(entry.dwStatFramerateAvg), "rtss_stat_framerate_avg"
+
         return 0.0, "rtss_no_fps"
+
+    def _extract_frametime_ms(self, entry: RTSSSharedMemoryAppEntryPrefix, fps: float) -> float:
+        if entry.dwFrameTime > 0:
+            return round(entry.dwFrameTime / 1000.0, 2)
+        if fps > 0:
+            return round(1000.0 / fps, 2)
+        return 0.0
+
+    def _normalize_stat_fps(self, value: int) -> float:
+        if value >= 1000:
+            return value / 10.0
+        return float(value)
 
     def _compute_age_ms(self, current_tick_ms: int, sample_tick_ms: int) -> Optional[int]:
         if sample_tick_ms == 0:
@@ -572,6 +653,57 @@ class RtssSharedMemoryReader:
         if not result:
             return 0
         return int(info.RegionSize)
+
+    def _field_offsets(self) -> Dict[str, int]:
+        return {
+            "dwFlags": RTSSSharedMemoryAppEntryPrefix.dwFlags.offset,
+            "dwTime0": RTSSSharedMemoryAppEntryPrefix.dwTime0.offset,
+            "dwTime1": RTSSSharedMemoryAppEntryPrefix.dwTime1.offset,
+            "dwFrames": RTSSSharedMemoryAppEntryPrefix.dwFrames.offset,
+            "dwFrameTime": RTSSSharedMemoryAppEntryPrefix.dwFrameTime.offset,
+            "dwStatFlags": RTSSSharedMemoryAppEntryPrefix.dwStatFlags.offset,
+            "dwStatTime0": RTSSSharedMemoryAppEntryPrefix.dwStatTime0.offset,
+            "dwStatTime1": RTSSSharedMemoryAppEntryPrefix.dwStatTime1.offset,
+            "dwStatFrames": RTSSSharedMemoryAppEntryPrefix.dwStatFrames.offset,
+            "dwStatCount": RTSSSharedMemoryAppEntryPrefix.dwStatCount.offset,
+            "dwStatFramerateMin": RTSSSharedMemoryAppEntryPrefix.dwStatFramerateMin.offset,
+            "dwStatFramerateAvg": RTSSSharedMemoryAppEntryPrefix.dwStatFramerateAvg.offset,
+            "dwStatFramerateMax": RTSSSharedMemoryAppEntryPrefix.dwStatFramerateMax.offset,
+            "legacy_dwFlags": RTSSSharedMemoryAppEntryLegacyGuess.dwFlags.offset,
+            "legacy_dwTime0": RTSSSharedMemoryAppEntryLegacyGuess.dwTime0.offset,
+            "legacy_dwTime1": RTSSSharedMemoryAppEntryLegacyGuess.dwTime1.offset,
+            "legacy_dwFrames": RTSSSharedMemoryAppEntryLegacyGuess.dwFrames.offset,
+            "legacy_dwFrameTime": RTSSSharedMemoryAppEntryLegacyGuess.dwFrameTime.offset,
+            "legacy_dwStatFlags": RTSSSharedMemoryAppEntryLegacyGuess.dwStatFlags.offset,
+            "legacy_dwStatTime0": RTSSSharedMemoryAppEntryLegacyGuess.dwStatTime0.offset,
+            "legacy_dwStatTime1": RTSSSharedMemoryAppEntryLegacyGuess.dwStatTime1.offset,
+            "legacy_dwStatFrames": RTSSSharedMemoryAppEntryLegacyGuess.dwStatFrames.offset,
+            "legacy_dwStatCount": RTSSSharedMemoryAppEntryLegacyGuess.dwStatCount.offset,
+            "legacy_dwStatFramerate": RTSSSharedMemoryAppEntryLegacyGuess.dwStatFramerate.offset,
+            "legacy_dwStatFrameTime": RTSSSharedMemoryAppEntryLegacyGuess.dwStatFrameTime.offset,
+            "legacy_dwStatFrameTimeBufFramerate": RTSSSharedMemoryAppEntryLegacyGuess.dwStatFrameTimeBufFramerate.offset,
+        }
+
+    def _build_entry_hexdumps(self, entry_address: int, entry_size: int) -> Dict[str, str]:
+        current_start = max(0, self._field_offsets()["dwTime0"] - 16)
+        legacy_start = max(0, self._field_offsets()["legacy_dwTime0"] - 16)
+        current_len = min(96, max(0, entry_size - current_start))
+        legacy_len = min(96, max(0, entry_size - legacy_start))
+        return {
+            "current_stat_region": self._hexdump(entry_address, current_start, current_len),
+            "legacy_guess_region": self._hexdump(entry_address, legacy_start, legacy_len),
+        }
+
+    def _hexdump(self, entry_address: int, start_offset: int, length: int) -> str:
+        if length <= 0:
+            return ""
+        data = ctypes.string_at(entry_address + start_offset, length)
+        lines = []
+        for chunk_start in range(0, len(data), 16):
+            chunk = data[chunk_start : chunk_start + 16]
+            hex_bytes = " ".join(f"{byte:02X}" for byte in chunk)
+            lines.append(f"+0x{start_offset + chunk_start:04X}: {hex_bytes}")
+        return "\n".join(lines)
 
     def _validate_app_bounds(self, header: RTSSSharedMemoryHeader, mapping_size: int) -> Optional[str]:
         if mapping_size <= 0:

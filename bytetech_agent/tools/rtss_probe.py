@@ -26,6 +26,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2000,
         help="Stale timeout used for reject classification.",
     )
+    parser.add_argument(
+        "--inspect-entry-index",
+        type=int,
+        default=-1,
+        help="Optional app entry index for extra offset/hexdump diagnostics.",
+    )
+    parser.add_argument(
+        "--inspect-pid",
+        type=int,
+        default=0,
+        help="Optional PID for extra offset/hexdump diagnostics.",
+    )
     return parser
 
 
@@ -91,6 +103,13 @@ def _render_entry(entry: RtssEntryDiagnostic) -> List[str]:
     ]
     raw_fields = " ".join(f"{key}={value}" for key, value in entry.raw_fields.items())
     lines.append(f"    raw_fields {raw_fields}")
+    if entry.field_offsets:
+        field_offsets = " ".join(f"{key}=0x{value:X}" for key, value in entry.field_offsets.items())
+        lines.append(f"    field_offsets {field_offsets}")
+    for label, dump in entry.hexdumps.items():
+        if dump:
+            lines.append(f"    hexdump[{label}]")
+            lines.extend(f"      {line}" for line in dump.splitlines())
     return lines
 
 
@@ -100,7 +119,10 @@ def main() -> int:
         shared_memory_name=args.shared_memory_name,
         stale_timeout_ms=args.stale_timeout_ms,
     )
-    results = reader.probe_mappings()
+    results = reader.probe_mappings(
+        inspect_entry_index=args.inspect_entry_index if args.inspect_entry_index >= 0 else None,
+        inspect_pid=args.inspect_pid if args.inspect_pid > 0 else None,
+    )
     print(render_probe_results(results), end="")
 
     for result in results:
