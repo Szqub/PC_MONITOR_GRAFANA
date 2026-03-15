@@ -9,7 +9,7 @@ from bytetech_agent.providers.presentmon_provider import PresentMonProvider
 from bytetech_agent.providers.rtss_provider import (
     RTSS_RING_BUFFER_VERSION,
     RTSS_SIGNATURE,
-    RTSSSharedMemoryAppEntry,
+    RTSSSharedMemoryAppEntryPrefix,
     RTSSSharedMemoryHeader,
     RtssProvider,
     RtssSharedMemoryReader,
@@ -20,7 +20,7 @@ def _make_rtss_buffer(pid=4242, process_name="game.exe", framerate_tenths=600):
     header = RTSSSharedMemoryHeader()
     header.dwSignature = RTSS_SIGNATURE
     header.dwVersion = RTSS_RING_BUFFER_VERSION
-    header.dwAppEntrySize = ctypes.sizeof(RTSSSharedMemoryAppEntry)
+    header.dwAppEntrySize = ctypes.sizeof(RTSSSharedMemoryAppEntryPrefix)
     header.dwAppArrOffset = ctypes.sizeof(RTSSSharedMemoryHeader)
     header.dwAppArrSize = 1
     header.dwOSDEntrySize = 0
@@ -28,7 +28,7 @@ def _make_rtss_buffer(pid=4242, process_name="game.exe", framerate_tenths=600):
     header.dwOSDArrSize = 0
     header.dwOSDFrame = 0
 
-    entry = RTSSSharedMemoryAppEntry()
+    entry = RTSSSharedMemoryAppEntryPrefix()
     entry.dwProcessID = pid
     entry.szProcessName = process_name.encode("ascii")
     current_tick_ms = int(ctypes.windll.kernel32.GetTickCount64() & 0xFFFFFFFF)
@@ -52,7 +52,7 @@ def test_rtss_reader_parses_single_entry():
     reader = RtssSharedMemoryReader(shared_memory_name="RTSSSharedMemoryV2", stale_timeout_ms=5000)
     blob = _make_rtss_buffer()
 
-    result = reader._parse_view(ctypes.addressof(blob))
+    result = reader._parse_view(ctypes.addressof(blob), "RTSSSharedMemoryV2")
 
     assert result.status == "ok"
     assert len(result.entries) == 1

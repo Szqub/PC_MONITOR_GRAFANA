@@ -38,7 +38,6 @@ WINDOW_NOW_SECONDS = 1.0
 WINDOW_10S_SECONDS = 10.0
 WINDOW_30S_SECONDS = 30.0
 RTSS_SIGNATURE = int.from_bytes(b"RTSS", "little")
-RTSS_MIN_VERSION = 0x00020000
 RTSS_RING_BUFFER_VERSION = 0x00020005
 MAX_PATH_CHARS = 260
 
@@ -75,7 +74,7 @@ class RTSSSharedMemoryHeader(ctypes.Structure):
     ]
 
 
-class RTSSSharedMemoryAppEntry(ctypes.Structure):
+class RTSSSharedMemoryAppEntryPrefix(ctypes.Structure):
     _fields_ = [
         ("dwProcessID", ctypes.c_uint32),
         ("szProcessName", ctypes.c_char * MAX_PATH_CHARS),
@@ -93,10 +92,6 @@ class RTSSSharedMemoryAppEntry(ctypes.Structure):
         ("dwStatFramerate", ctypes.c_uint32),
         ("dwStatFrameTime", ctypes.c_uint32),
         ("dwStatFrameTimeBufFramerate", ctypes.c_uint32),
-        ("dwStatFrameTimeBuf", ctypes.c_uint32),
-        ("dwStatFrameTimeBufPos", ctypes.c_uint32),
-        ("dwOSDX", ctypes.c_uint32),
-        ("dwOSDY", ctypes.c_uint32),
     ]
 
 
@@ -219,70 +214,116 @@ class RtssSharedMemoryReader:
     def __init__(self, shared_memory_name: str, stale_timeout_ms: int):
         self._shared_memory_name = shared_memory_name
         self._stale_timeout_ms = stale_timeout_ms
+        self._last_status_log_monotonic = 0.0
 
     def read_entries(self) -> RtssReadResult:
-        mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, self._shared_memory_name)
-        if not mapping:
-            return RtssReadResult(
-                status="mapping_unavailable",
-                entries=[],
-                error=f"RTSS shared memory '{self._shared_memory_name}' is not available.",
-            )
+        attempted_names = []
+        for mapping_name in self._candidate_mapping_names():
+            attempted_names.append(mapping_name)
+            mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, mapping_name)
+            if not mapping:
+                continue
 
-        view = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)
-        if not view:
-            kernel32.CloseHandle(mapping)
-            return RtssReadResult(
-                status="map_failed",
-                entries=[],
-                error=f"Failed to map RTSS shared memory '{self._shared_memory_name}'.",
-            )
+            view = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)
+            if not view:
+                kernel32.CloseHandle(mapping)
+                return RtssReadResult(
+                    status="map_failed",
+                    entries=[],
+                    error=f"Failed to map RTSS shared memory '{mapping_name}'.",
+                )
 
-        try:
-            return self._parse_view(view)
-        finally:
-            kernel32.UnmapViewOfFile(view)
-            kernel32.CloseHandle(mapping)
+            try:
+                result = self._parse_view(view, mapping_name)
+                if result.status == "ok":
+                    return result
+                self._log_debug_once(
+                    "RTSS mapping '%s' opened but parse failed: %s",
+                    mapping_name,
+                    result.error or result.status,
+                )
+            finally:
+                kernel32.UnmapViewOfFile(view)
+                kernel32.CloseHandle(mapping)
 
-    def _parse_view(self, view: int) -> RtssReadResult:
+        return RtssReadResult(
+            status="mapping_unavailable",
+            entries=[],
+            error=(
+                "RTSS shared memory mapping is not available. attempted_names="
+                + ",".join(attempted_names)
+            ),
+        )
+
+    def _candidate_mapping_names(self) -> List[str]:
+        base_names = [
+            self._shared_memory_name,
+            "RTSSSharedMemoryV2",
+            "RTSSSharedMemory",
+        ]
+        candidates = []
+        for base_name in base_names:
+            if not base_name:
+                continue
+            candidates.append(base_name)
+            candidates.append(f"Global\\{base_name}")
+            candidates.append(f"Local\\{base_name}")
+        seen = []
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.append(candidate)
+        return seen
+
+    def _parse_view(self, view: int, mapping_name: str) -> RtssReadResult:
         header = RTSSSharedMemoryHeader.from_address(view)
-        if header.dwSignature != RTSS_SIGNATURE or header.dwVersion < RTSS_MIN_VERSION:
+        if header.dwSignature != RTSS_SIGNATURE:
             return RtssReadResult(
                 status="invalid_header",
                 entries=[],
                 error=(
-                    f"Unexpected RTSS header signature/version: "
-                    f"signature=0x{header.dwSignature:08X} version=0x{header.dwVersion:08X}"
+                    f"Unexpected RTSS header in mapping '{mapping_name}': "
+                    f"signature=0x{header.dwSignature:08X} version=0x{header.dwVersion:08X} "
+                    f"app_entry_size={header.dwAppEntrySize} app_arr_offset={header.dwAppArrOffset} "
+                    f"app_arr_size={header.dwAppArrSize}"
                 ),
             )
 
-        if header.dwAppEntrySize < ctypes.sizeof(RTSSSharedMemoryAppEntry):
+        min_entry_size = ctypes.sizeof(RTSSSharedMemoryAppEntryPrefix)
+        if header.dwAppEntrySize < min_entry_size:
             return RtssReadResult(
                 status="unsupported_layout",
                 entries=[],
                 error=(
                     f"RTSS app entry size {header.dwAppEntrySize} is smaller than expected "
-                    f"{ctypes.sizeof(RTSSSharedMemoryAppEntry)}."
+                    f"{min_entry_size} for required prefix layout."
                 ),
             )
 
         entries: List[RtssAppRecord] = []
         current_tick_ms = int(kernel32.GetTickCount64() & 0xFFFFFFFF)
+        skipped_zero_pid = 0
+        skipped_no_name = 0
+        skipped_no_fps = 0
+        skipped_stale = 0
         for index in range(header.dwAppArrSize):
             entry_address = view + header.dwAppArrOffset + index * header.dwAppEntrySize
-            entry = RTSSSharedMemoryAppEntry.from_address(entry_address)
+            entry = RTSSSharedMemoryAppEntryPrefix.from_address(entry_address)
             if entry.dwProcessID == 0:
+                skipped_zero_pid += 1
                 continue
 
             process_name = self._decode_c_string(entry.szProcessName)
             if not process_name:
+                skipped_no_name += 1
                 continue
 
             fps, source_quality = self._extract_fps(header.dwVersion, entry)
             if fps <= 0:
+                skipped_no_fps += 1
                 continue
 
             if self._is_stale(current_tick_ms, entry.dwTime1):
+                skipped_stale += 1
                 continue
 
             entries.append(
@@ -296,12 +337,24 @@ class RtssSharedMemoryReader:
                 )
             )
 
+        self._log_debug_once(
+            "RTSS mapping '%s' parsed. version=0x%08X app_arr_size=%s kept=%s "
+            "skipped_zero_pid=%s skipped_no_name=%s skipped_no_fps=%s skipped_stale=%s",
+            mapping_name,
+            header.dwVersion,
+            header.dwAppArrSize,
+            len(entries),
+            skipped_zero_pid,
+            skipped_no_name,
+            skipped_no_fps,
+            skipped_stale,
+        )
         return RtssReadResult(status="ok", entries=entries)
 
     def _decode_c_string(self, buffer) -> str:
         return bytes(buffer).split(b"\0", 1)[0].decode("utf-8", errors="ignore").strip()
 
-    def _extract_fps(self, version: int, entry: RTSSSharedMemoryAppEntry) -> tuple[float, str]:
+    def _extract_fps(self, version: int, entry: RTSSSharedMemoryAppEntryPrefix) -> tuple[float, str]:
         if version >= RTSS_RING_BUFFER_VERSION and entry.dwStatFrameTimeBufFramerate > 0:
             return entry.dwStatFrameTimeBufFramerate / 10.0, "rtss_ring_buffer_sampled"
 
@@ -313,8 +366,18 @@ class RtssSharedMemoryReader:
         return 0.0, "rtss_no_fps"
 
     def _is_stale(self, current_tick_ms: int, sample_tick_ms: int) -> bool:
+        if sample_tick_ms == 0:
+            return False
         age = (current_tick_ms - sample_tick_ms) & 0xFFFFFFFF
+        if age > 0x7FFFFFFF:
+            return False
         return age > self._stale_timeout_ms
+
+    def _log_debug_once(self, message: str, *args):
+        now = time.monotonic()
+        if now - self._last_status_log_monotonic >= 5.0:
+            logger.debug(message, *args)
+            self._last_status_log_monotonic = now
 
 
 class RtssProvider(BaseProvider):

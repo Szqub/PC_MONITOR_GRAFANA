@@ -183,6 +183,11 @@ RTSS diagnosis checklist:
 3. Verify RTSS OSD/shared memory support is available.
 4. Run the agent.
 5. Check logs for backend tag and RTSS shared memory availability.
+6. If `pc_fps` is still missing, inspect `rtss_provider` DEBUG logs for:
+   - attempted mapping names such as `RTSSSharedMemoryV2`, `RTSSSharedMemory`, `Global\\...`, `Local\\...`
+   - RTSS header details: signature, version, `dwAppEntrySize`, `dwAppArrOffset`, `dwAppArrSize`
+   - parser counters: `kept`, `skipped_zero_pid`, `skipped_no_name`, `skipped_no_fps`, `skipped_stale`
+   - process selection and target matching decisions
 
 ### Testing
 
@@ -207,6 +212,7 @@ No FPS in Grafana:
 3. Confirm RTSS shared memory is available.
 4. Confirm the game is the active foreground target when using `active_foreground`.
 5. If using PresentMon fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
+6. If RTSS initializes as healthy but still returns zero metrics, inspect `rtss_provider` DEBUG output before suspecting the scheduler, Influx writer, or Grafana.
 
 Example Flux check:
 
@@ -382,6 +388,11 @@ Checklist dla RTSS:
 3. Upewnij się, że RTSS udostępnia shared memory.
 4. Uruchom agenta.
 5. Sprawdź logi pod kątem dostępności RTSS i taga `backend`.
+6. Jeżeli dalej nie ma `pc_fps`, sprawdź logi DEBUG z `rtss_provider`, w szczególności:
+   - próbowane nazwy mappingu: `RTSSSharedMemoryV2`, `RTSSSharedMemory`, `Global\\...`, `Local\\...`
+   - szczegóły headera RTSS: sygnatura, wersja, `dwAppEntrySize`, `dwAppArrOffset`, `dwAppArrSize`
+   - liczniki parsera: `kept`, `skipped_zero_pid`, `skipped_no_name`, `skipped_no_fps`, `skipped_stale`
+   - decyzje o wyborze targetu i dopasowaniu procesu
 
 ### Testy
 
@@ -404,6 +415,7 @@ pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\te
 3. Potwierdź, że RTSS shared memory jest dostępne.
 4. Przy `active_foreground` upewnij się, że gra jest faktycznie aktywnym oknem.
 5. Przy fallbacku PresentMon upewnij się, że ścieżka wskazuje standalone console executable, a nie GUI `PresentMonApplication`.
+6. Jeżeli provider RTSS zgłasza się jako healthy, ale nadal zwraca 0 rekordów, szukaj problemu najpierw w DEBUG logach `rtss_provider`, a nie w schedulerze czy writerze InfluxDB.
 
 Przykładowe zapytanie Flux:
 
