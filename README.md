@@ -132,6 +132,12 @@ If RTSS shared memory is not available:
 - if `fallback_backend` is configured, the router may try PresentMon console
 - otherwise no FPS metric is emitted for that cycle
 
+RTSS V2 note:
+
+- the provider accepts newer RTSS V2 layouts with large `app_entry_size` and large offsets
+- parsing is guarded by bounds checking against `mapping_size`
+- only a safe prefix of each app entry is required for FPS parsing
+
 ### PresentMon Fallback Rules
 
 PresentMon console is no longer the recommended primary backend.
@@ -345,6 +351,12 @@ Jeżeli RTSS shared memory nie jest dostępne:
 - provider RTSS loguje precyzyjny techniczny komunikat
 - jeśli skonfigurowano `fallback_backend`, router może spróbować PresentMon console
 - w przeciwnym razie w tej iteracji nie powstaje `pc_fps`
+
+Uwaga dla RTSS V2:
+
+- provider akceptuje nowsze layouty RTSS V2 z dużym `app_entry_size` i dużymi offsetami
+- parsowanie jest zabezpieczone bounds checkingiem względem `mapping_size`
+- do odczytu FPS wymagany jest tylko bezpieczny prefix wpisu aplikacji
 
 ### Zasady dla fallbacku PresentMon
 

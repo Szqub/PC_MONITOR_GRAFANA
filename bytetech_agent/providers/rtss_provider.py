@@ -37,7 +37,8 @@ FILE_MAP_READ = 0x0004
 WINDOW_NOW_SECONDS = 1.0
 WINDOW_10S_SECONDS = 10.0
 WINDOW_30S_SECONDS = 30.0
-RTSS_SIGNATURE = int.from_bytes(b"RTSS", "little")
+RTSS_SIGNATURE = int.from_bytes(b"RTSS", "big")
+RTSS_SIGNATURE_LEGACY = int.from_bytes(b"RTSS", "little")
 RTSS_RING_BUFFER_VERSION = 0x00020005
 MAX_PATH_CHARS = 260
 
@@ -400,7 +401,7 @@ class RtssSharedMemoryReader:
             osd_arr_size=header.dwOSDArrSize,
             osd_frame=header.dwOSDFrame,
         )
-        if header.dwSignature != RTSS_SIGNATURE:
+        if header.dwSignature not in (RTSS_SIGNATURE, RTSS_SIGNATURE_LEGACY):
             return RtssProbeResult(
                 mapping_name=mapping_name,
                 mapping_found=True,
@@ -410,7 +411,8 @@ class RtssSharedMemoryReader:
                     f"Unexpected RTSS header in mapping '{mapping_name}': "
                     f"signature=0x{header.dwSignature:08X} version=0x{header.dwVersion:08X} "
                     f"app_entry_size={header.dwAppEntrySize} app_arr_offset={header.dwAppArrOffset} "
-                    f"app_arr_size={header.dwAppArrSize}"
+                    f"app_arr_size={header.dwAppArrSize} expected_signatures="
+                    f"[0x{RTSS_SIGNATURE:08X},0x{RTSS_SIGNATURE_LEGACY:08X}]"
                 ),
                 header=header_info,
                 entry_diagnostics=[],
@@ -427,6 +429,18 @@ class RtssSharedMemoryReader:
                     f"RTSS app entry size {header.dwAppEntrySize} is smaller than expected "
                     f"{min_entry_size} for required prefix layout."
                 ),
+                header=header_info,
+                entry_diagnostics=[],
+            )
+
+        bounds_error = self._validate_app_bounds(header, mapping_size)
+        if bounds_error:
+            return RtssProbeResult(
+                mapping_name=mapping_name,
+                mapping_found=True,
+                mapping_size=mapping_size,
+                status="out_of_bounds",
+                error=bounds_error,
                 header=header_info,
                 entry_diagnostics=[],
             )
@@ -558,6 +572,40 @@ class RtssSharedMemoryReader:
         if not result:
             return 0
         return int(info.RegionSize)
+
+    def _validate_app_bounds(self, header: RTSSSharedMemoryHeader, mapping_size: int) -> Optional[str]:
+        if mapping_size <= 0:
+            return None
+
+        header_size = ctypes.sizeof(RTSSSharedMemoryHeader)
+        if mapping_size < header_size:
+            return (
+                f"RTSS mapping is smaller than header size. mapping_size={mapping_size} "
+                f"header_size={header_size}"
+            )
+
+        if header.dwAppArrOffset < header_size:
+            return (
+                f"RTSS app array offset points inside header. app_arr_offset={header.dwAppArrOffset} "
+                f"header_size={header_size}"
+            )
+
+        if header.dwAppArrOffset > mapping_size:
+            return (
+                f"RTSS app array offset is outside mapping. app_arr_offset={header.dwAppArrOffset} "
+                f"mapping_size={mapping_size}"
+            )
+
+        total_app_bytes = header.dwAppEntrySize * header.dwAppArrSize
+        app_region_end = header.dwAppArrOffset + total_app_bytes
+        if total_app_bytes < 0 or app_region_end > mapping_size:
+            return (
+                f"RTSS app array exceeds mapping bounds. app_arr_offset={header.dwAppArrOffset} "
+                f"app_entry_size={header.dwAppEntrySize} app_arr_size={header.dwAppArrSize} "
+                f"app_region_end={app_region_end} mapping_size={mapping_size}"
+            )
+
+        return None
 
     def _log_debug_once(self, message: str, *args):
         now = time.monotonic()

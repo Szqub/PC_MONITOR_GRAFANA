@@ -52,6 +52,38 @@ def _make_rtss_buffer(pid=4242, process_name="game.exe", framerate_tenths=600):
     return blob
 
 
+def _make_live_rtss_v2_buffer():
+    mapping_size = 5578752
+    header = RTSSSharedMemoryHeader()
+    header.dwSignature = 0x52545353
+    header.dwVersion = 0x00020015
+    header.dwAppEntrySize = 12416
+    header.dwAppArrOffset = 2396256
+    header.dwAppArrSize = 256
+    header.dwOSDEntrySize = 299520
+    header.dwOSDArrOffset = 96
+    header.dwOSDArrSize = 8
+    header.dwOSDFrame = 7301
+
+    blob = ctypes.create_string_buffer(mapping_size)
+    ctypes.memmove(ctypes.addressof(blob), ctypes.addressof(header), ctypes.sizeof(header))
+
+    entry = RTSSSharedMemoryAppEntryPrefix()
+    entry.dwProcessID = 4242
+    entry.szProcessName = b"game.exe"
+    current_tick_ms = int(ctypes.windll.kernel32.GetTickCount64() & 0xFFFFFFFF)
+    entry.dwTime0 = (current_tick_ms - 500) & 0xFFFFFFFF
+    entry.dwTime1 = current_tick_ms
+    entry.dwFrames = 30
+    entry.dwStatFrameTimeBufFramerate = 600
+    ctypes.memmove(
+        ctypes.addressof(blob) + header.dwAppArrOffset,
+        ctypes.addressof(entry),
+        ctypes.sizeof(entry),
+    )
+    return blob, mapping_size
+
+
 def test_rtss_reader_parses_single_entry():
     reader = RtssSharedMemoryReader(shared_memory_name="RTSSSharedMemoryV2", stale_timeout_ms=5000)
     blob = _make_rtss_buffer()
@@ -83,6 +115,24 @@ def test_rtss_reader_probe_marks_stale_entry_as_rejected():
     assert result.entry_diagnostics[0].kept is False
     assert result.entry_diagnostics[0].reject_reason == "stale"
     assert result.kept_entries == []
+
+
+def test_rtss_reader_accepts_live_rtss_v2_header_when_bounds_are_safe():
+    reader = RtssSharedMemoryReader(shared_memory_name="RTSSSharedMemoryV2", stale_timeout_ms=5000)
+    blob, mapping_size = _make_live_rtss_v2_buffer()
+
+    result = reader._parse_view(ctypes.addressof(blob), "RTSSSharedMemoryV2", mapping_size)
+
+    assert result.status == "ok"
+    assert result.header is not None
+    assert result.header.signature == 0x52545353
+    assert result.header.version == 0x00020015
+    assert result.header.app_entry_size == 12416
+    assert result.header.app_arr_offset == 2396256
+    assert result.header.app_arr_size == 256
+    assert len(result.entry_diagnostics) == 256
+    assert result.kept_entries[0].pid == 4242
+    assert result.kept_entries[0].process_name == "game.exe"
 
 
 def test_rtss_provider_emits_pc_fps_metric_from_entries():
