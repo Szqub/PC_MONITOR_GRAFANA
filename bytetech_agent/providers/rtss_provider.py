@@ -58,6 +58,8 @@ kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
 kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
 kernel32.GetTickCount64.argtypes = []
 kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+kernel32.VirtualQuery.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+kernel32.VirtualQuery.restype = ctypes.c_size_t
 
 
 class RTSSSharedMemoryHeader(ctypes.Structure):
@@ -95,6 +97,18 @@ class RTSSSharedMemoryAppEntryPrefix(ctypes.Structure):
     ]
 
 
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", ctypes.wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", ctypes.wintypes.DWORD),
+        ("Protect", ctypes.wintypes.DWORD),
+        ("Type", ctypes.wintypes.DWORD),
+    ]
+
+
 @dataclass(frozen=True)
 class RtssSample:
     timestamp_monotonic: float
@@ -117,6 +131,20 @@ class RtssReadResult:
     status: str
     entries: List["RtssAppRecord"]
     error: Optional[str] = None
+    mapping_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RtssHeaderInfo:
+    signature: int
+    version: int
+    app_entry_size: int
+    app_arr_offset: int
+    app_arr_size: int
+    osd_entry_size: int
+    osd_arr_offset: int
+    osd_arr_size: int
+    osd_frame: int
 
 
 @dataclass(frozen=True)
@@ -127,6 +155,51 @@ class RtssAppRecord:
     frametime_ms: float
     source_quality: str
     last_tick_ms: int
+
+
+@dataclass(frozen=True)
+class RtssEntryDiagnostic:
+    index: int
+    pid: int
+    process_name: str
+    profile_name: str
+    fps: float
+    frametime_ms: float
+    source_quality: str
+    sample_tick_ms: int
+    age_ms: Optional[int]
+    kept: bool
+    reject_reason: Optional[str]
+    raw_fields: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class RtssProbeResult:
+    mapping_name: str
+    mapping_found: bool
+    mapping_size: int
+    status: str
+    error: Optional[str]
+    header: Optional[RtssHeaderInfo]
+    entry_diagnostics: List[RtssEntryDiagnostic]
+
+    @property
+    def kept_entries(self) -> List[RtssAppRecord]:
+        entries = []
+        for entry in self.entry_diagnostics:
+            if not entry.kept:
+                continue
+            entries.append(
+                RtssAppRecord(
+                    pid=entry.pid,
+                    process_name=entry.process_name,
+                    fps=entry.fps,
+                    frametime_ms=entry.frametime_ms,
+                    source_quality=entry.source_quality,
+                    last_tick_ms=entry.sample_tick_ms,
+                )
+            )
+        return entries
 
 
 class RtssRollingStats:
@@ -217,43 +290,43 @@ class RtssSharedMemoryReader:
         self._last_status_log_monotonic = 0.0
 
     def read_entries(self) -> RtssReadResult:
-        attempted_names = []
-        for mapping_name in self._candidate_mapping_names():
-            attempted_names.append(mapping_name)
-            mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, mapping_name)
-            if not mapping:
-                continue
-
-            view = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)
-            if not view:
-                kernel32.CloseHandle(mapping)
-                return RtssReadResult(
-                    status="map_failed",
-                    entries=[],
-                    error=f"Failed to map RTSS shared memory '{mapping_name}'.",
-                )
-
-            try:
-                result = self._parse_view(view, mapping_name)
-                if result.status == "ok":
-                    return result
-                self._log_debug_once(
-                    "RTSS mapping '%s' opened but parse failed: %s",
-                    mapping_name,
-                    result.error or result.status,
-                )
-            finally:
-                kernel32.UnmapViewOfFile(view)
-                kernel32.CloseHandle(mapping)
-
+        probe = self.read_probe()
+        if probe.status == "ok":
+            return RtssReadResult(
+                status="ok",
+                entries=probe.kept_entries,
+                mapping_name=probe.mapping_name,
+            )
         return RtssReadResult(
-            status="mapping_unavailable",
+            status=probe.status,
             entries=[],
-            error=(
-                "RTSS shared memory mapping is not available. attempted_names="
-                + ",".join(attempted_names)
-            ),
+            error=probe.error,
+            mapping_name=probe.mapping_name,
         )
+
+    def read_probe(self) -> RtssProbeResult:
+        probes = self.probe_mappings()
+        for probe in probes:
+            if probe.status == "ok":
+                return probe
+
+        attempted_names = ",".join(probe.mapping_name for probe in probes)
+        opened_results = [probe for probe in probes if probe.mapping_found]
+        if opened_results:
+            return opened_results[-1]
+
+        return RtssProbeResult(
+            mapping_name=attempted_names,
+            mapping_found=False,
+            mapping_size=0,
+            status="mapping_unavailable",
+            error=f"RTSS shared memory mapping is not available. attempted_names={attempted_names}",
+            header=None,
+            entry_diagnostics=[],
+        )
+
+    def probe_mappings(self) -> List[RtssProbeResult]:
+        return [self._probe_mapping(mapping_name) for mapping_name in self._candidate_mapping_names()]
 
     def _candidate_mapping_names(self) -> List[str]:
         base_names = [
@@ -274,82 +347,163 @@ class RtssSharedMemoryReader:
                 seen.append(candidate)
         return seen
 
-    def _parse_view(self, view: int, mapping_name: str) -> RtssReadResult:
+    def _probe_mapping(self, mapping_name: str) -> RtssProbeResult:
+        mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, mapping_name)
+        if not mapping:
+            return RtssProbeResult(
+                mapping_name=mapping_name,
+                mapping_found=False,
+                mapping_size=0,
+                status="mapping_unavailable",
+                error=None,
+                header=None,
+                entry_diagnostics=[],
+            )
+
+        view = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)
+        if not view:
+            kernel32.CloseHandle(mapping)
+            return RtssProbeResult(
+                mapping_name=mapping_name,
+                mapping_found=True,
+                mapping_size=0,
+                status="map_failed",
+                error=f"Failed to map RTSS shared memory '{mapping_name}'.",
+                header=None,
+                entry_diagnostics=[],
+            )
+
+        try:
+            mapping_size = self._query_view_region_size(view)
+            result = self._parse_view(view, mapping_name, mapping_size)
+            if result.status != "ok":
+                self._log_debug_once(
+                    "RTSS mapping '%s' opened but parse failed: %s",
+                    mapping_name,
+                    result.error or result.status,
+                )
+            return result
+        finally:
+            kernel32.UnmapViewOfFile(view)
+            kernel32.CloseHandle(mapping)
+
+    def _parse_view(self, view: int, mapping_name: str, mapping_size: int = 0) -> RtssProbeResult:
         header = RTSSSharedMemoryHeader.from_address(view)
+        header_info = RtssHeaderInfo(
+            signature=header.dwSignature,
+            version=header.dwVersion,
+            app_entry_size=header.dwAppEntrySize,
+            app_arr_offset=header.dwAppArrOffset,
+            app_arr_size=header.dwAppArrSize,
+            osd_entry_size=header.dwOSDEntrySize,
+            osd_arr_offset=header.dwOSDArrOffset,
+            osd_arr_size=header.dwOSDArrSize,
+            osd_frame=header.dwOSDFrame,
+        )
         if header.dwSignature != RTSS_SIGNATURE:
-            return RtssReadResult(
+            return RtssProbeResult(
+                mapping_name=mapping_name,
+                mapping_found=True,
+                mapping_size=mapping_size,
                 status="invalid_header",
-                entries=[],
                 error=(
                     f"Unexpected RTSS header in mapping '{mapping_name}': "
                     f"signature=0x{header.dwSignature:08X} version=0x{header.dwVersion:08X} "
                     f"app_entry_size={header.dwAppEntrySize} app_arr_offset={header.dwAppArrOffset} "
                     f"app_arr_size={header.dwAppArrSize}"
                 ),
+                header=header_info,
+                entry_diagnostics=[],
             )
 
         min_entry_size = ctypes.sizeof(RTSSSharedMemoryAppEntryPrefix)
         if header.dwAppEntrySize < min_entry_size:
-            return RtssReadResult(
+            return RtssProbeResult(
+                mapping_name=mapping_name,
+                mapping_found=True,
+                mapping_size=mapping_size,
                 status="unsupported_layout",
-                entries=[],
                 error=(
                     f"RTSS app entry size {header.dwAppEntrySize} is smaller than expected "
                     f"{min_entry_size} for required prefix layout."
                 ),
+                header=header_info,
+                entry_diagnostics=[],
             )
 
-        entries: List[RtssAppRecord] = []
         current_tick_ms = int(kernel32.GetTickCount64() & 0xFFFFFFFF)
-        skipped_zero_pid = 0
-        skipped_no_name = 0
-        skipped_no_fps = 0
-        skipped_stale = 0
+        entry_diagnostics: List[RtssEntryDiagnostic] = []
         for index in range(header.dwAppArrSize):
             entry_address = view + header.dwAppArrOffset + index * header.dwAppEntrySize
             entry = RTSSSharedMemoryAppEntryPrefix.from_address(entry_address)
-            if entry.dwProcessID == 0:
-                skipped_zero_pid += 1
-                continue
-
             process_name = self._decode_c_string(entry.szProcessName)
-            if not process_name:
-                skipped_no_name += 1
-                continue
-
+            profile_name = self._decode_c_string(entry.szProfileName)
             fps, source_quality = self._extract_fps(header.dwVersion, entry)
-            if fps <= 0:
-                skipped_no_fps += 1
-                continue
-
-            if self._is_stale(current_tick_ms, entry.dwTime1):
-                skipped_stale += 1
-                continue
-
-            entries.append(
-                RtssAppRecord(
+            frametime_ms = round(1000.0 / fps, 2) if fps > 0 else 0.0
+            age_ms = self._compute_age_ms(current_tick_ms, entry.dwTime1)
+            reject_reason = self._classify_entry_rejection(
+                pid=entry.dwProcessID,
+                process_name=process_name,
+                fps=fps,
+                age_ms=age_ms,
+            )
+            entry_diagnostics.append(
+                RtssEntryDiagnostic(
+                    index=index,
                     pid=entry.dwProcessID,
                     process_name=process_name,
+                    profile_name=profile_name,
                     fps=round(fps, 2),
-                    frametime_ms=round(1000.0 / fps, 2),
+                    frametime_ms=frametime_ms,
                     source_quality=source_quality,
-                    last_tick_ms=entry.dwTime1,
+                    sample_tick_ms=entry.dwTime1,
+                    age_ms=age_ms,
+                    kept=reject_reason is None,
+                    reject_reason=reject_reason,
+                    raw_fields={
+                        "dwFlags": entry.dwFlags,
+                        "dwTime0": entry.dwTime0,
+                        "dwTime1": entry.dwTime1,
+                        "dwFrames": entry.dwFrames,
+                        "dwFrameTime": entry.dwFrameTime,
+                        "dwStatFlags": entry.dwStatFlags,
+                        "dwStatTime0": entry.dwStatTime0,
+                        "dwStatTime1": entry.dwStatTime1,
+                        "dwStatFrames": entry.dwStatFrames,
+                        "dwStatCount": entry.dwStatCount,
+                        "dwStatFramerate": entry.dwStatFramerate,
+                        "dwStatFrameTime": entry.dwStatFrameTime,
+                        "dwStatFrameTimeBufFramerate": entry.dwStatFrameTimeBufFramerate,
+                    },
                 )
             )
 
+        kept_count = sum(1 for entry in entry_diagnostics if entry.kept)
+        skipped_zero_pid = sum(1 for entry in entry_diagnostics if entry.reject_reason == "zero_pid")
+        skipped_no_name = sum(1 for entry in entry_diagnostics if entry.reject_reason == "empty_name")
+        skipped_no_fps = sum(1 for entry in entry_diagnostics if entry.reject_reason == "zero_fps")
+        skipped_stale = sum(1 for entry in entry_diagnostics if entry.reject_reason == "stale")
         self._log_debug_once(
             "RTSS mapping '%s' parsed. version=0x%08X app_arr_size=%s kept=%s "
             "skipped_zero_pid=%s skipped_no_name=%s skipped_no_fps=%s skipped_stale=%s",
             mapping_name,
             header.dwVersion,
             header.dwAppArrSize,
-            len(entries),
+            kept_count,
             skipped_zero_pid,
             skipped_no_name,
             skipped_no_fps,
             skipped_stale,
         )
-        return RtssReadResult(status="ok", entries=entries)
+        return RtssProbeResult(
+            mapping_name=mapping_name,
+            mapping_found=True,
+            mapping_size=mapping_size,
+            status="ok",
+            error=None,
+            header=header_info,
+            entry_diagnostics=entry_diagnostics,
+        )
 
     def _decode_c_string(self, buffer) -> str:
         return bytes(buffer).split(b"\0", 1)[0].decode("utf-8", errors="ignore").strip()
@@ -365,13 +519,45 @@ class RtssSharedMemoryReader:
 
         return 0.0, "rtss_no_fps"
 
-    def _is_stale(self, current_tick_ms: int, sample_tick_ms: int) -> bool:
+    def _compute_age_ms(self, current_tick_ms: int, sample_tick_ms: int) -> Optional[int]:
         if sample_tick_ms == 0:
-            return False
+            return None
         age = (current_tick_ms - sample_tick_ms) & 0xFFFFFFFF
         if age > 0x7FFFFFFF:
-            return False
-        return age > self._stale_timeout_ms
+            return None
+        return int(age)
+
+    def _is_stale(self, current_tick_ms: int, sample_tick_ms: int) -> bool:
+        age = self._compute_age_ms(current_tick_ms, sample_tick_ms)
+        return age is not None and age > self._stale_timeout_ms
+
+    def _classify_entry_rejection(
+        self,
+        pid: int,
+        process_name: str,
+        fps: float,
+        age_ms: Optional[int],
+    ) -> Optional[str]:
+        if pid == 0:
+            return "zero_pid"
+        if not process_name:
+            return "empty_name"
+        if fps <= 0:
+            return "zero_fps"
+        if age_ms is not None and age_ms > self._stale_timeout_ms:
+            return "stale"
+        return None
+
+    def _query_view_region_size(self, view: int) -> int:
+        info = MEMORY_BASIC_INFORMATION()
+        result = kernel32.VirtualQuery(
+            ctypes.c_void_p(view),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not result:
+            return 0
+        return int(info.RegionSize)
 
     def _log_debug_once(self, message: str, *args):
         now = time.monotonic()
@@ -417,13 +603,29 @@ class RtssProvider(BaseProvider):
 
     def _collect(self, context: ProviderContext) -> List[MetricData]:
         target = self._resolve_target()
-        result = self._reader.read_entries()
+        probe = self._reader.read_probe()
         now = time.monotonic()
 
-        if result.status != "ok":
+        if probe.status != "ok":
             self._rolling.prune(now)
-            self._log_reader_issue(result.error or result.status)
+            self._log_reader_issue(probe.error or probe.status)
             return []
+
+        result = RtssReadResult(
+            status=probe.status,
+            entries=probe.kept_entries,
+            error=probe.error,
+            mapping_name=probe.mapping_name,
+        )
+        rejected_counts = self._summarize_rejections(probe.entry_diagnostics)
+        logger.debug(
+            "RTSS read succeeded. mapping=%s mapping_size=%s kept=%s rejected=%s target=%s",
+            probe.mapping_name,
+            probe.mapping_size,
+            len(result.entries),
+            rejected_counts,
+            target,
+        )
 
         self._last_reader_error = None
         for entry in result.entries:
@@ -520,10 +722,12 @@ class RtssProvider(BaseProvider):
         }
 
         logger.debug(
-            "RTSS metric values before MetricData: reason=%s fields=%s tags=%s",
+            "RTSS metric values before MetricData: reason=%s fields=%s tags=%s target=%s entry_count=%s",
             reason,
             fields,
             tags,
+            target,
+            len(entries),
         )
 
         return MetricData(measurement_name="pc_fps", tags=tags, fields=fields)
@@ -583,3 +787,19 @@ class RtssProvider(BaseProvider):
         if now - self._last_reader_error_log_monotonic >= 10.0:
             logger.debug("RTSS shared memory unavailable: %s", message)
             self._last_reader_error_log_monotonic = now
+
+    def _summarize_rejections(self, entry_diagnostics: List[RtssEntryDiagnostic]) -> Dict[str, int]:
+        summary = {
+            "kept": 0,
+            "zero_pid": 0,
+            "empty_name": 0,
+            "zero_fps": 0,
+            "stale": 0,
+        }
+        for entry in entry_diagnostics:
+            if entry.kept:
+                summary["kept"] += 1
+                continue
+            if entry.reject_reason in summary:
+                summary[entry.reject_reason] += 1
+        return summary

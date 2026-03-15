@@ -9,11 +9,15 @@ from bytetech_agent.providers.presentmon_provider import PresentMonProvider
 from bytetech_agent.providers.rtss_provider import (
     RTSS_RING_BUFFER_VERSION,
     RTSS_SIGNATURE,
+    RtssEntryDiagnostic,
+    RtssProbeResult,
     RTSSSharedMemoryAppEntryPrefix,
     RTSSSharedMemoryHeader,
+    RtssHeaderInfo,
     RtssProvider,
     RtssSharedMemoryReader,
 )
+from bytetech_agent.tools.rtss_probe import render_probe_results
 
 
 def _make_rtss_buffer(pid=4242, process_name="game.exe", framerate_tenths=600):
@@ -55,11 +59,30 @@ def test_rtss_reader_parses_single_entry():
     result = reader._parse_view(ctypes.addressof(blob), "RTSSSharedMemoryV2")
 
     assert result.status == "ok"
-    assert len(result.entries) == 1
-    assert result.entries[0].pid == 4242
-    assert result.entries[0].process_name == "game.exe"
-    assert result.entries[0].fps == 60.0
-    assert result.entries[0].frametime_ms > 0
+    assert len(result.kept_entries) == 1
+    assert result.kept_entries[0].pid == 4242
+    assert result.kept_entries[0].process_name == "game.exe"
+    assert result.kept_entries[0].fps == 60.0
+    assert result.kept_entries[0].frametime_ms > 0
+
+
+def test_rtss_reader_probe_marks_stale_entry_as_rejected():
+    reader = RtssSharedMemoryReader(shared_memory_name="RTSSSharedMemoryV2", stale_timeout_ms=1000)
+    blob = _make_rtss_buffer()
+    header = RTSSSharedMemoryHeader.from_address(ctypes.addressof(blob))
+    entry_address = ctypes.addressof(blob) + header.dwAppArrOffset
+    entry = RTSSSharedMemoryAppEntryPrefix.from_address(entry_address)
+    current_tick_ms = int(ctypes.windll.kernel32.GetTickCount64() & 0xFFFFFFFF)
+    entry.dwTime0 = (current_tick_ms - 6000) & 0xFFFFFFFF
+    entry.dwTime1 = (current_tick_ms - 5000) & 0xFFFFFFFF
+
+    result = reader._parse_view(ctypes.addressof(blob), "RTSSSharedMemoryV2")
+
+    assert result.status == "ok"
+    assert len(result.entry_diagnostics) == 1
+    assert result.entry_diagnostics[0].kept is False
+    assert result.entry_diagnostics[0].reject_reason == "stale"
+    assert result.kept_entries == []
 
 
 def test_rtss_provider_emits_pc_fps_metric_from_entries():
@@ -69,9 +92,9 @@ def test_rtss_provider_emits_pc_fps_metric_from_entries():
         presentmon_config=SimpleNamespace(target_mode="explicit_process_id", process_name=None, process_id=4242),
     )
     provider.initialize()
-    provider._reader.read_entries = lambda: SimpleNamespace(
+    provider._reader.read_probe = lambda: SimpleNamespace(
         status="ok",
-        entries=[
+        kept_entries=[
             SimpleNamespace(
                 pid=4242,
                 process_name="game.exe",
@@ -81,6 +104,10 @@ def test_rtss_provider_emits_pc_fps_metric_from_entries():
                 last_tick_ms=1,
             )
         ],
+        entry_diagnostics=[],
+        error=None,
+        mapping_name="RTSSSharedMemoryV2",
+        mapping_size=4096,
     )
     context = ProviderContext(host_alias="PC1", host_name="pc1")
 
@@ -93,6 +120,52 @@ def test_rtss_provider_emits_pc_fps_metric_from_entries():
     assert metric.tags["pid"] == "4242"
     assert metric.fields["fps_now"] > 0
     assert metric.fields["source_quality"] == "rtss_ring_buffer_sampled"
+
+
+def test_rtss_probe_renderer_outputs_entry_decision_and_raw_fields():
+    rendered = render_probe_results(
+        [
+            RtssProbeResult(
+                mapping_name="RTSSSharedMemoryV2",
+                mapping_found=True,
+                mapping_size=4096,
+                status="ok",
+                error=None,
+                header=RtssHeaderInfo(
+                    signature=RTSS_SIGNATURE,
+                    version=RTSS_RING_BUFFER_VERSION,
+                    app_entry_size=1232,
+                    app_arr_offset=36,
+                    app_arr_size=1,
+                    osd_entry_size=0,
+                    osd_arr_offset=0,
+                    osd_arr_size=0,
+                    osd_frame=0,
+                ),
+                entry_diagnostics=[
+                    RtssEntryDiagnostic(
+                        index=0,
+                        pid=4242,
+                        process_name="game.exe",
+                        profile_name="game",
+                        fps=60.0,
+                        frametime_ms=16.67,
+                        source_quality="rtss_ring_buffer_sampled",
+                        sample_tick_ms=123,
+                        age_ms=12,
+                        kept=False,
+                        reject_reason="zero_fps",
+                        raw_fields={"dwFrames": 30, "dwStatFrameTimeBufFramerate": 600},
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert "mapping=RTSSSharedMemoryV2" in rendered
+    assert "decision=rejected" in rendered
+    assert "reason=zero_fps" in rendered
+    assert "raw_fields dwFrames=30 dwStatFrameTimeBufFramerate=600" in rendered
 
 
 class StubMetricsProvider(BaseProvider):

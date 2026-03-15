@@ -176,14 +176,22 @@ python -m bytetech_agent.tools.presentmon_stdout_probe --process-name dwm.exe --
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-id 1234 --duration 5
 ```
 
+RTSS raw shared-memory probe:
+
+```powershell
+python -m bytetech_agent.tools.rtss_probe
+python -m bytetech_agent.tools.rtss_probe --shared-memory-name RTSSSharedMemoryV2 --stale-timeout-ms 2000
+```
+
 RTSS diagnosis checklist:
 
 1. Start RTSS.
 2. Start a game or target process.
 3. Verify RTSS OSD/shared memory support is available.
 4. Run the agent.
-5. Check logs for backend tag and RTSS shared memory availability.
-6. If `pc_fps` is still missing, inspect `rtss_provider` DEBUG logs for:
+5. Run `rtss_probe.py` to inspect raw mappings, header values, entry sizes, and per-entry reject reasons.
+6. Check logs for backend tag and RTSS shared memory availability.
+7. If `pc_fps` is still missing, inspect `rtss_provider` DEBUG logs for:
    - attempted mapping names such as `RTSSSharedMemoryV2`, `RTSSSharedMemory`, `Global\\...`, `Local\\...`
    - RTSS header details: signature, version, `dwAppEntrySize`, `dwAppArrOffset`, `dwAppArrSize`
    - parser counters: `kept`, `skipped_zero_pid`, `skipped_no_name`, `skipped_no_fps`, `skipped_stale`
@@ -210,9 +218,10 @@ No FPS in Grafana:
 1. Check `backend` tag in `pc_fps`.
 2. Confirm RTSS is running.
 3. Confirm RTSS shared memory is available.
-4. Confirm the game is the active foreground target when using `active_foreground`.
-5. If using PresentMon fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
-6. If RTSS initializes as healthy but still returns zero metrics, inspect `rtss_provider` DEBUG output before suspecting the scheduler, Influx writer, or Grafana.
+4. Run `python -m bytetech_agent.tools.rtss_probe` and inspect the raw `kept` / `rejected` decisions per app entry.
+5. Confirm the game is the active foreground target when using `active_foreground`.
+6. If using PresentMon fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
+7. If RTSS initializes as healthy but still returns zero metrics, inspect `rtss_provider` DEBUG output before suspecting the scheduler, Influx writer, or Grafana.
 
 Example Flux check:
 
@@ -381,14 +390,22 @@ python -m bytetech_agent.tools.presentmon_stdout_probe --process-name dwm.exe --
 python -m bytetech_agent.tools.presentmon_stdout_probe --process-id 1234 --duration 5
 ```
 
+Surowy probe RTSS shared memory:
+
+```powershell
+python -m bytetech_agent.tools.rtss_probe
+python -m bytetech_agent.tools.rtss_probe --shared-memory-name RTSSSharedMemoryV2 --stale-timeout-ms 2000
+```
+
 Checklist dla RTSS:
 
 1. Uruchom RTSS.
 2. Uruchom grę albo proces docelowy.
 3. Upewnij się, że RTSS udostępnia shared memory.
 4. Uruchom agenta.
-5. Sprawdź logi pod kątem dostępności RTSS i taga `backend`.
-6. Jeżeli dalej nie ma `pc_fps`, sprawdź logi DEBUG z `rtss_provider`, w szczególności:
+5. Uruchom `rtss_probe.py`, żeby zobaczyć surowe mappingi, header, entry size oraz powody `kept` / `rejected` dla każdego wpisu.
+6. Sprawdź logi pod kątem dostępności RTSS i taga `backend`.
+7. Jeżeli dalej nie ma `pc_fps`, sprawdź logi DEBUG z `rtss_provider`, w szczególności:
    - próbowane nazwy mappingu: `RTSSSharedMemoryV2`, `RTSSSharedMemory`, `Global\\...`, `Local\\...`
    - szczegóły headera RTSS: sygnatura, wersja, `dwAppEntrySize`, `dwAppArrOffset`, `dwAppArrSize`
    - liczniki parsera: `kept`, `skipped_zero_pid`, `skipped_no_name`, `skipped_no_fps`, `skipped_stale`
@@ -413,9 +430,10 @@ pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\te
 1. Sprawdź tag `backend` w `pc_fps`.
 2. Potwierdź, że RTSS działa.
 3. Potwierdź, że RTSS shared memory jest dostępne.
-4. Przy `active_foreground` upewnij się, że gra jest faktycznie aktywnym oknem.
-5. Przy fallbacku PresentMon upewnij się, że ścieżka wskazuje standalone console executable, a nie GUI `PresentMonApplication`.
-6. Jeżeli provider RTSS zgłasza się jako healthy, ale nadal zwraca 0 rekordów, szukaj problemu najpierw w DEBUG logach `rtss_provider`, a nie w schedulerze czy writerze InfluxDB.
+4. Uruchom `python -m bytetech_agent.tools.rtss_probe` i sprawdź surowe decyzje `kept` / `rejected` dla wpisów aplikacji.
+5. Przy `active_foreground` upewnij się, że gra jest faktycznie aktywnym oknem.
+6. Przy fallbacku PresentMon upewnij się, że ścieżka wskazuje standalone console executable, a nie GUI `PresentMonApplication`.
+7. Jeżeli provider RTSS zgłasza się jako healthy, ale nadal zwraca 0 rekordów, szukaj problemu najpierw w DEBUG logach `rtss_provider`, a nie w schedulerze czy writerze InfluxDB.
 
 Przykładowe zapytanie Flux:
 
