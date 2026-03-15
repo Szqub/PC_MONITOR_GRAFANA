@@ -103,6 +103,23 @@ class TestBufferConfig:
         assert cfg.max_spool_files == 50
 
 
+class TestPresentMonConfig:
+    def test_defaults(self):
+        cfg = PresentMonConfig()
+        assert cfg.target_mode == "active_foreground"
+        assert cfg.process_name is None
+        assert cfg.process_id is None
+
+    def test_normalizes_explicit_pid_alias(self):
+        cfg = PresentMonConfig(target_mode="explicit_pid", process_id=1234)
+        assert cfg.target_mode == "explicit_process_id"
+        assert cfg.process_id == 1234
+
+    def test_rejects_invalid_target_mode(self):
+        with pytest.raises(Exception):
+            PresentMonConfig(target_mode="bad_mode")
+
+
 class TestOptionsConfig:
     def test_retention_hint_days(self):
         cfg = OptionsConfig()

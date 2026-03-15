@@ -76,7 +76,7 @@ Fields written to `pc_fps`:
 - `cpu_busy_ms` when available
 - `gpu_busy_ms` when available
 - `display_latency_ms` when available
-- `present_mode` when available
+- `present_mode_name` when available
 
 ### Important PresentMon Notes
 
@@ -258,7 +258,7 @@ Pola zapisywane do `pc_fps`:
 - `cpu_busy_ms` jeśli dostępne
 - `gpu_busy_ms` jeśli dostępne
 - `display_latency_ms` jeśli dostępne
-- `present_mode` jeśli dostępne
+- `present_mode_name` jeśli dostępne
 
 ### Ważne uwagi o PresentMon
 

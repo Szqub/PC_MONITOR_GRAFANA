@@ -2,7 +2,7 @@
 ByteTech Agent - central configuration module.
 Pydantic validation, YAML loading, consistent naming.
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, Optional, List
 import yaml
 import os
@@ -44,6 +44,37 @@ class PresentMonConfig(BaseModel):
     process_name: Optional[str] = None
     process_id: Optional[int] = None
     executable_path: Optional[str] = None
+
+    @field_validator("target_mode", mode="before")
+    @classmethod
+    def _normalize_target_mode(cls, value):
+        normalized = str(value or "active_foreground").strip().lower()
+        if normalized == "explicit_pid":
+            normalized = "explicit_process_id"
+        allowed = {
+            "active_foreground",
+            "explicit_process_name",
+            "explicit_process_id",
+        }
+        if normalized not in allowed:
+            raise ValueError(f"Unsupported presentmon.target_mode: {value!r}")
+        return normalized
+
+    @field_validator("process_name", mode="before")
+    @classmethod
+    def _normalize_process_name(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    @field_validator("process_id", mode="before")
+    @classmethod
+    def _normalize_process_id(cls, value):
+        if value in (None, "", 0, "0"):
+            return None
+        normalized = int(value)
+        return normalized if normalized > 0 else None
 
 
 class LoggingConfig(BaseModel):

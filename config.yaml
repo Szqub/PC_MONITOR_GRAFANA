@@ -29,9 +29,14 @@ lhm:
   json_url: "http://127.0.0.1:8085"
 
 presentmon:
+  # valid values:
+  # - active_foreground
+  # - explicit_process_name
+  # - explicit_process_id
   target_mode: "active_foreground"
   process_name: ""
   process_id: 0
+  executable_path: ""
 
 logging:
   level: "INFO"

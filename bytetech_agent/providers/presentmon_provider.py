@@ -41,6 +41,7 @@ WINDOW_30S_SECONDS = 30.0
 STARTUP_LINE_LOG_LIMIT = 5
 RECORD_LOG_INTERVAL = 120
 CREATE_NO_WINDOW = 0x08000000
+LAUNCH_RETRY_BACKOFF_SECONDS = 5.0
 
 
 def _safe_float(raw: Optional[str]) -> Optional[float]:
@@ -197,7 +198,7 @@ class RollingProcessStats:
         cpu_busy = self._avg_optional(one_second, "cpu_busy_ms")
         gpu_busy = self._avg_optional(one_second, "gpu_busy_ms")
         display_latency = self._avg_optional(one_second, "display_latency_ms")
-        present_mode = self._dominant_present_mode(one_second)
+        present_mode_name = self._dominant_present_mode(one_second)
 
         if cpu_busy is not None:
             fields["cpu_busy_ms"] = cpu_busy
@@ -205,8 +206,8 @@ class RollingProcessStats:
             fields["gpu_busy_ms"] = gpu_busy
         if display_latency is not None:
             fields["display_latency_ms"] = display_latency
-        if present_mode is not None:
-            fields["present_mode"] = present_mode
+        if present_mode_name is not None:
+            fields["present_mode_name"] = present_mode_name
 
         return fields
 
@@ -281,7 +282,6 @@ class PresentMonProvider(BaseProvider):
         self._capture_process: Optional[subprocess.Popen] = None
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
         self._process_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._stats_by_pid: Dict[int, RollingProcessStats] = {}
@@ -289,6 +289,8 @@ class PresentMonProvider(BaseProvider):
         self._records_processed = 0
         self._reader_generation = 0
         self._last_capture_error: Optional[str] = None
+        self._next_launch_retry_monotonic = 0.0
+        self._last_retry_skip_log_monotonic = 0.0
 
     def initialize(self) -> bool:
         self._exe_path = self._discover_presentmon_exe()
@@ -309,7 +311,7 @@ class PresentMonProvider(BaseProvider):
             "cpu_busy_ms": True,
             "gpu_busy_ms": True,
             "display_latency_ms": True,
-            "present_mode": True,
+            "present_mode_name": True,
         }
         self._health.status = ProviderStatus.AVAILABLE
         logger.debug("PresentMon console provider ready. exe=%s", self._exe_path)
@@ -322,7 +324,6 @@ class PresentMonProvider(BaseProvider):
         return [metric]
 
     def shutdown(self):
-        self._stop_event.set()
         self._ensure_capture_target(None)
 
     def _discover_presentmon_exe(self) -> Optional[str]:
@@ -425,6 +426,26 @@ class PresentMonProvider(BaseProvider):
             if self._targets_match(self._active_target, target) and self._process_running():
                 return
 
+            now = time.monotonic()
+            if (
+                self._targets_match(self._active_target, target)
+                and target is not None
+                and self._last_capture_error
+                and now < self._next_launch_retry_monotonic
+            ):
+                if now - self._last_retry_skip_log_monotonic >= LAUNCH_RETRY_BACKOFF_SECONDS:
+                    remaining = max(0.0, self._next_launch_retry_monotonic - now)
+                    logger.debug(
+                        "PresentMon launch retry deferred for %.1fs after previous start failure. "
+                        "target=%s (%s) error=%s",
+                        remaining,
+                        target.process_name,
+                        target.filter_value,
+                        self._last_capture_error,
+                    )
+                    self._last_retry_skip_log_monotonic = now
+                return
+
             if self._active_target and target and self._active_target.key != target.key:
                 logger.debug(
                     "PresentMon target switch: %s (%s) -> %s (%s)",
@@ -449,6 +470,8 @@ class PresentMonProvider(BaseProvider):
             self._stop_capture_locked()
             self._active_target = target
             self._last_capture_error = None
+            self._next_launch_retry_monotonic = 0.0
+            self._last_retry_skip_log_monotonic = 0.0
 
             if target is not None:
                 self._start_capture_locked(target)
@@ -489,10 +512,13 @@ class PresentMonProvider(BaseProvider):
             )
         except OSError as exc:
             self._last_capture_error = str(exc)
+            self._next_launch_retry_monotonic = time.monotonic() + LAUNCH_RETRY_BACKOFF_SECONDS
             logger.error("PresentMon subprocess failed to start: %s", exc)
             self._capture_process = None
             return
 
+        self._next_launch_retry_monotonic = 0.0
+        self._last_retry_skip_log_monotonic = 0.0
         logger.debug("PresentMon subprocess started. pid=%s", self._capture_process.pid)
 
         self._stdout_thread = threading.Thread(
@@ -542,6 +568,8 @@ class PresentMonProvider(BaseProvider):
         if stderr_thread:
             stderr_thread.join(timeout=1)
 
+        logger.debug("PresentMon subprocess stopped. exit_code=%s", process.poll())
+
     def _build_command(self, target: PresentMonTarget) -> List[str]:
         command = [
             self._exe_path or "PresentMon.exe",
@@ -551,6 +579,7 @@ class PresentMonProvider(BaseProvider):
             "--session_name",
             f"ByteTechAgent-{os.getpid()}",
         ]
+        # `--output_stdout` and `--no_csv` are mutually exclusive in PresentMon CLI.
 
         if target.filter_kind == "process_id":
             command.extend(["--process_id", target.filter_value])
@@ -598,6 +627,12 @@ class PresentMonProvider(BaseProvider):
                         self._records_processed,
                     )
 
+        logger.debug(
+            "PresentMon stdout reader exiting. generation=%s exit_code=%s",
+            generation,
+            process.poll(),
+        )
+
     def _stderr_reader_loop(self, process: subprocess.Popen, generation: int):
         startup_lines_logged = 0
         if not process.stderr:
@@ -612,6 +647,12 @@ class PresentMonProvider(BaseProvider):
                 startup_lines_logged += 1
             elif line:
                 logger.debug("PresentMon stderr: %s", line)
+
+        logger.debug(
+            "PresentMon stderr reader exiting. generation=%s exit_code=%s",
+            generation,
+            process.poll(),
+        )
 
     def _build_metric(
         self,
@@ -638,9 +679,9 @@ class PresentMonProvider(BaseProvider):
             if value is not None:
                 fields[optional_field] = float(value)
 
-        present_mode = snapshot.get("present_mode")
-        if present_mode:
-            fields["present_mode"] = present_mode
+        present_mode_name = snapshot.get("present_mode_name")
+        if present_mode_name:
+            fields["present_mode_name"] = present_mode_name
 
         tags = {
             "host": context.host_alias,

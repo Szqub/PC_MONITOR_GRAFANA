@@ -75,7 +75,7 @@ These measurements contain actual telemetry values collected by the underlying p
 - *(Dynamically detected fan RPMs)*
 
 ### `pc_fps`
-**Source:** PresentMon (API or ETW Fallback)  
+**Source:** PresentMon console stdout parser  
 **Cadence:** `fps_interval` (default 1s)  
 **Note:** Only emitted when an active game/process is detected dynamically.  
 **Tags:** `host`, `process_name`, `pid`, `app_mode`, `backend`  
@@ -86,7 +86,10 @@ These measurements contain actual telemetry values collected by the underlying p
 - `fps_avg_30s` (float)
 - `fps_1pct_30s` (float)
 - `fps_0_1pct_30s` (float)
-*(If using the native PresentMon API extension instead of ETW fallback, the following fields are also emitted: `cpu_busy_ms`, `gpu_busy_ms`, `display_latency_ms`)*
+- `cpu_busy_ms` (float, optional)
+- `gpu_busy_ms` (float, optional)
+- `display_latency_ms` (float, optional)
+- `present_mode_name` (string, optional safe field name to avoid historical type conflicts with older numeric `present_mode` data)
 
 ---
 
