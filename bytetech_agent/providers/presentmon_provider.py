@@ -1,422 +1,723 @@
 """
-ByteTech Agent – PresentMon Provider (V2 API)
-Integracja z Intel PresentMon Service (PresentMonAPI2.dll).
-Zbiera realne metryki FPS/frame timing z użyciem natywnych zapytań dynamicznych (PM_DYNAMIC_QUERY).
-"""
-import ctypes
-import ctypes.wintypes
-import logging
-import os
-import time
-import threading
-from typing import List, Optional
+ByteTech Agent - PresentMon provider backed by PresentMon console stdout.
 
-from bytetech_agent.providers.base import BaseProvider
+This implementation intentionally avoids PresentMon Shared Service / API V2.
+It launches the standalone PresentMon console application as a subprocess,
+parses frame-level CSV rows from stdout, maintains rolling windows in memory,
+and emits a single `pc_fps` measurement for the current target process.
+"""
+from __future__ import annotations
+
+import csv
+import logging
+import math
+import os
+import shutil
+import subprocess
+import threading
+import time
+from collections import Counter, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Iterable, List, Optional
+
+import psutil
+
 from bytetech_agent.models.metrics import MetricData, ProviderContext, ProviderStatus
+from bytetech_agent.providers.base import BaseProvider
+
+try:
+    import win32gui
+    import win32process
+except ImportError:  # pragma: no cover - Windows deployments should have pywin32
+    win32gui = None
+    win32process = None
 
 logger = logging.getLogger(__name__)
 
-# --- CTypes Struktury i Definicje API (PresentMon V2) ---
+BACKEND_NAME = "presentmon_console_stdout"
+WINDOW_NOW_SECONDS = 1.0
+WINDOW_10S_SECONDS = 10.0
+WINDOW_30S_SECONDS = 30.0
+STARTUP_LINE_LOG_LIMIT = 5
+RECORD_LOG_INTERVAL = 120
+CREATE_NO_WINDOW = 0x08000000
 
-class PM_QUERY_ELEMENT(ctypes.Structure):
-    _fields_ = [
-        ("metric", ctypes.c_uint32),
-        ("stat", ctypes.c_uint32),
-        ("deviceId", ctypes.c_uint32),
-        ("arrayIndex", ctypes.c_uint32),
-        ("dataOffset", ctypes.c_uint64),
-        ("dataSize", ctypes.c_uint64),
-    ]
 
-# Zidentyfikowane (po introspekcji API) identyfikatory metryk docelowych
-PM_METRIC_CPU_BUSY = 9
-PM_METRIC_DISPLAYED_FPS = 11
-PM_METRIC_PRESENTED_FPS = 12
-PM_METRIC_GPU_BUSY = 14
-PM_METRIC_PRESENT_MODE = 20
-PM_METRIC_DISPLAY_LATENCY = 24
-PM_METRIC_DISPLAYED_FRAME_TIME = 85
-PM_METRIC_PRESENTED_FRAME_TIME = 87
+def _safe_float(raw: Optional[str]) -> Optional[float]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.upper() in {"NA", "N/A", "NULL", "NONE"}:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return value
 
-# Statystyki z API Intela
-PM_STAT_NONE = 0
-PM_STAT_AVG = 1
-PM_STAT_PERCENTILE_99 = 2
-PM_STAT_PERCENTILE_95 = 3
-PM_STAT_PERCENTILE_90 = 4
-PM_STAT_PERCENTILE_01 = 5
-PM_STAT_PERCENTILE_05 = 6
-PM_STAT_PERCENTILE_10 = 7
-PM_STAT_MAX = 8
-PM_STAT_MIN = 9
 
-PM_STATUS_SUCCESS = 0
+def _safe_int(raw: Optional[str]) -> Optional[int]:
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class PresentMonFrameSample:
+    timestamp_monotonic: float
+    process_name: str
+    pid: int
+    frametime_ms: float
+    cpu_busy_ms: Optional[float] = None
+    gpu_busy_ms: Optional[float] = None
+    display_latency_ms: Optional[float] = None
+    present_mode: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PresentMonTarget:
+    mode: str
+    filter_kind: str
+    filter_value: str
+    pid: int
+    process_name: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.filter_kind}:{self.filter_value}"
+
+
+class PresentMonCsvParser:
+    """Parses PresentMon CSV rows written to stdout."""
+
+    def __init__(self):
+        self._header: Optional[List[str]] = None
+
+    @property
+    def header(self) -> Optional[List[str]]:
+        return self._header
+
+    def parse_line(self, line: str) -> Optional[PresentMonFrameSample]:
+        stripped = line.strip()
+        if not stripped:
+            return None
+
+        row = next(csv.reader([stripped]))
+        if not row:
+            return None
+
+        if self._is_header_row(row):
+            self._header = row
+            return None
+
+        if self._header is None:
+            raise ValueError("PresentMon stdout row received before CSV header.")
+
+        if len(row) != len(self._header):
+            raise ValueError(
+                f"Unexpected CSV column count {len(row)} != {len(self._header)}."
+            )
+
+        data = dict(zip(self._header, row))
+        pid = _safe_int(data.get("ProcessID"))
+        if pid is None or pid <= 0:
+            raise ValueError(f"Invalid ProcessID value: {data.get('ProcessID')!r}")
+
+        frametime_ms = self._extract_frametime_ms(data)
+        if frametime_ms is None or frametime_ms <= 0:
+            return None
+
+        return PresentMonFrameSample(
+            timestamp_monotonic=time.monotonic(),
+            process_name=(data.get("Application") or "unknown").strip() or "unknown",
+            pid=pid,
+            frametime_ms=frametime_ms,
+            cpu_busy_ms=self._extract_optional(data, "CPUBusy", "MsCPUBusy"),
+            gpu_busy_ms=self._extract_optional(data, "GPUBusy", "MsGPUBusy"),
+            display_latency_ms=self._extract_optional(data, "DisplayLatency", "MsUntilDisplayed"),
+            present_mode=(data.get("PresentMode") or "").strip() or None,
+        )
+
+    def _is_header_row(self, row: List[str]) -> bool:
+        return "Application" in row and "ProcessID" in row
+
+    def _extract_optional(self, data: Dict[str, str], *keys: str) -> Optional[float]:
+        for key in keys:
+            value = _safe_float(data.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _extract_frametime_ms(self, data: Dict[str, str]) -> Optional[float]:
+        for key in ("FrameTime", "MsBetweenPresents", "DisplayedTime"):
+            value = _safe_float(data.get(key))
+            if value is not None and value > 0:
+                return value
+        return None
+
+
+class RollingProcessStats:
+    """Maintains per-process rolling frame samples for 1s / 10s / 30s windows."""
+
+    def __init__(self, pid: int, process_name: str):
+        self.pid = pid
+        self.process_name = process_name
+        self.samples: Deque[PresentMonFrameSample] = deque()
+        self.last_sample_monotonic: Optional[float] = None
+
+    def add_sample(self, sample: PresentMonFrameSample):
+        self.process_name = sample.process_name
+        self.last_sample_monotonic = sample.timestamp_monotonic
+        self.samples.append(sample)
+        self._evict(sample.timestamp_monotonic)
+
+    def snapshot(self, now: Optional[float] = None) -> Dict[str, object]:
+        now = now if now is not None else time.monotonic()
+        self._evict(now)
+
+        one_second = self._slice_window(now, WINDOW_NOW_SECONDS)
+        ten_seconds = self._slice_window(now, WINDOW_10S_SECONDS)
+        thirty_seconds = self._slice_window(now, WINDOW_30S_SECONDS)
+
+        fields: Dict[str, object] = {
+            "fps_now": self._fps_from_samples(one_second),
+            "frametime_ms_now": self._avg_frametime(one_second),
+            "fps_avg_10s": self._fps_from_samples(ten_seconds),
+            "fps_avg_30s": self._fps_from_samples(thirty_seconds),
+            "fps_1pct_30s": self._low_percentile_fps(thirty_seconds, 0.01),
+            "fps_0_1pct_30s": self._low_percentile_fps(thirty_seconds, 0.001),
+            "sample_count_1s": len(one_second),
+            "sample_count_10s": len(ten_seconds),
+            "sample_count_30s": len(thirty_seconds),
+        }
+
+        cpu_busy = self._avg_optional(one_second, "cpu_busy_ms")
+        gpu_busy = self._avg_optional(one_second, "gpu_busy_ms")
+        display_latency = self._avg_optional(one_second, "display_latency_ms")
+        present_mode = self._dominant_present_mode(one_second)
+
+        if cpu_busy is not None:
+            fields["cpu_busy_ms"] = cpu_busy
+        if gpu_busy is not None:
+            fields["gpu_busy_ms"] = gpu_busy
+        if display_latency is not None:
+            fields["display_latency_ms"] = display_latency
+        if present_mode is not None:
+            fields["present_mode"] = present_mode
+
+        return fields
+
+    def has_recent_samples(self, now: Optional[float] = None, max_age_seconds: float = WINDOW_30S_SECONDS) -> bool:
+        now = now if now is not None else time.monotonic()
+        if self.last_sample_monotonic is None:
+            return False
+        return (now - self.last_sample_monotonic) <= max_age_seconds
+
+    def _evict(self, now: float):
+        min_timestamp = now - WINDOW_30S_SECONDS
+        while self.samples and self.samples[0].timestamp_monotonic < min_timestamp:
+            self.samples.popleft()
+
+    def _slice_window(self, now: float, window_seconds: float) -> List[PresentMonFrameSample]:
+        start = now - window_seconds
+        return [sample for sample in self.samples if sample.timestamp_monotonic >= start]
+
+    def _avg_frametime(self, samples: Iterable[PresentMonFrameSample]) -> float:
+        values = [sample.frametime_ms for sample in samples if sample.frametime_ms > 0]
+        if not values:
+            return 0.0
+        return round(sum(values) / len(values), 2)
+
+    def _fps_from_samples(self, samples: Iterable[PresentMonFrameSample]) -> float:
+        values = [sample.frametime_ms for sample in samples if sample.frametime_ms > 0]
+        if not values:
+            return 0.0
+        avg_frametime = sum(values) / len(values)
+        if avg_frametime <= 0:
+            return 0.0
+        return round(1000.0 / avg_frametime, 2)
+
+    def _low_percentile_fps(self, samples: Iterable[PresentMonFrameSample], percentile: float) -> float:
+        fps_values = sorted(
+            1000.0 / sample.frametime_ms
+            for sample in samples
+            if sample.frametime_ms > 0
+        )
+        if not fps_values:
+            return 0.0
+        if len(fps_values) == 1:
+            return round(fps_values[0], 2)
+        rank = max(0, math.ceil(len(fps_values) * percentile) - 1)
+        rank = min(rank, len(fps_values) - 1)
+        return round(fps_values[rank], 2)
+
+    def _avg_optional(self, samples: Iterable[PresentMonFrameSample], attribute_name: str) -> Optional[float]:
+        values = [
+            value for value in
+            (getattr(sample, attribute_name) for sample in samples)
+            if value is not None
+        ]
+        if not values:
+            return None
+        return round(sum(values) / len(values), 2)
+
+    def _dominant_present_mode(self, samples: Iterable[PresentMonFrameSample]) -> Optional[str]:
+        values = [sample.present_mode for sample in samples if sample.present_mode]
+        if not values:
+            return None
+        return Counter(values).most_common(1)[0][0]
+
 
 class PresentMonProvider(BaseProvider):
-    """
-    Provider metryki FPS/frame timing obsługujący Intel PresentMon V2.
-    """
+    """FPS provider using PresentMon console stdout streaming."""
 
     def __init__(self, config):
         super().__init__(name="PresentMon")
         self.config = config
-        self._pm_api_lib = None
-        self._session_handle = ctypes.c_void_p()
-        
-        # Uchwyty dynamicznych zapytań powiązane z różnymi oknami czasowymi
-        self._query_1s = ctypes.c_void_p()
-        self._query_10s = ctypes.c_void_p()
-        self._query_30s = ctypes.c_void_p()
-        
-        # Meta tablice określające jak parsować zwracane dane binarne z okien
-        self._layout_1s = []
-        self._layout_10s = []
-        self._layout_30s = []
-        self._blob_1s = None
-        self._blob_10s = None
-        self._blob_30s = None
-
-        self._active_pid: Optional[int] = None
-        self._active_process_name: Optional[str] = None
-        
-        self._current_backend = "none"
+        self._exe_path: Optional[str] = None
+        self._capture_process: Optional[subprocess.Popen] = None
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._process_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._stats_by_pid: Dict[int, RollingProcessStats] = {}
+        self._active_target: Optional[PresentMonTarget] = None
+        self._records_processed = 0
+        self._reader_generation = 0
+        self._last_capture_error: Optional[str] = None
 
     def initialize(self) -> bool:
-        if self._init_pm_service():
-            self._health.capabilities = {
-                "fps_now": True,
-                "frametime_ms_now": True,
-                "fps_avg_10s": True,
-                "fps_avg_30s": True,
-                "fps_1pct_30s": True,
-                "cpu_busy_ms": True,
-                "gpu_busy_ms": True,
-                "display_latency_ms": True,
-                "present_mode": True,
-                "fps_0_1pct_30s": False, # Explicitly missing in PresentMon API v2 native stats
-            }
-            self._health.status = ProviderStatus.AVAILABLE
-            self._current_backend = "presentmon_api"
-            return True
-
-        logger.warning(
-            "PresentMon Provider: Brak komunikacji z usługą PM V2. "
-            "Zainstaluj narzędzia Intel PresentMon, usługa musi działać w tle."
-        )
-        self._health.mark_unavailable("PresentMonAPI2.dll niedostępny lub usługa PM Service leży.")
-        return False
-
-    def _init_pm_service(self) -> bool:
-        """Ładuje bibliotekę i testuje otwarcie nowej sesji V2 komunikacji przez rurę."""
-        dll_names = ["PresentMonAPI2.dll", "PresentMonAPI2Loader.dll", "PresentMonAPI.dll"]
-        search_paths = [
-            os.path.join(os.environ.get("ProgramFiles", ""), "Intel", "PresentMonSharedService"),
-            os.path.join(os.environ.get("ProgramFiles", ""), "Intel", "PresentMon", "PresentMonApplication"),
-            os.path.join(os.environ.get("ProgramFiles", ""), "PresentMon"),
-            os.getcwd(),
-        ]
-
-        dll_path = None
-        for path in search_paths:
-            for name in dll_names:
-                full_path = os.path.join(path, name)
-                if os.path.isfile(full_path):
-                    if hasattr(os, "add_dll_directory"):
-                        try:
-                            os.add_dll_directory(path)
-                        except Exception:
-                            pass
-                    try:
-                        self._pm_api_lib = ctypes.cdll.LoadLibrary(full_path)
-                        dll_path = full_path
-                        break
-                    except OSError:
-                        continue
-            if self._pm_api_lib:
-                break
-
-        if not self._pm_api_lib:
-            logger.debug("Odmowa. Żaden DLL z rodziny PMv2 API nie został wykryty.")
+        self._exe_path = self._discover_presentmon_exe()
+        if not self._exe_path:
+            self._health.mark_unavailable("PresentMon.exe not found.")
+            logger.warning(
+                "PresentMon Provider unavailable: PresentMon.exe not found in known locations."
+            )
             return False
 
-        logger.debug(f"Załadowano backend API: {dll_path}")
-
-        if not hasattr(self._pm_api_lib, "pmOpenSession"):
-            logger.debug("To jest bardzo stary PM APIv1 DLL (brak pmOpenSession). Przerywam na V2.")
-            self._pm_api_lib = None
-            return False
-
-        # Inicjalizacja PM Sesji do Service
-        status = self._pm_api_lib.pmOpenSession(ctypes.byref(self._session_handle))
-        if status != PM_STATUS_SUCCESS:
-            logger.debug(f"Błąd otwarcia sesji The PresentMon Service (status {status}). Upewnij się, że usługa działa w tle na koncie administratora.")
-            self._pm_api_lib = None
-            return False
-
-        logger.debug("Zestawiono stabilną sesję IPC z Intel PresentMon Service.")
-        
-        # Definiowanie sygnatur funkcji API na ten wątek
-        self._setup_api_signatures()
-        
-        # Jeśli jesteśmy tutaj to API gra elegancko. Budujemy natywne okna zapytania (Dynamic Querying)
-        if not self._register_queries():
-            self._pm_api_lib.pmCloseSession(self._session_handle)
-            self._session_handle = ctypes.c_void_p()
-            self._pm_api_lib = None
-            return False
-
+        self._health.capabilities = {
+            "fps_now": True,
+            "frametime_ms_now": True,
+            "fps_avg_10s": True,
+            "fps_avg_30s": True,
+            "fps_1pct_30s": True,
+            "fps_0_1pct_30s": True,
+            "cpu_busy_ms": True,
+            "gpu_busy_ms": True,
+            "display_latency_ms": True,
+            "present_mode": True,
+        }
+        self._health.status = ProviderStatus.AVAILABLE
+        logger.debug("PresentMon console provider ready. exe=%s", self._exe_path)
         return True
 
-    def _setup_api_signatures(self):
-        """Deklaruje odpowiednie sygnatury C prewencyjnie dla funkcji z argumentami"""
-        self._pm_api_lib.pmRegisterDynamicQuery.restype = ctypes.c_uint32
-        self._pm_api_lib.pmRegisterDynamicQuery.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(PM_QUERY_ELEMENT), ctypes.c_uint64, ctypes.c_double, ctypes.c_double
+    def _collect(self, context: ProviderContext) -> List[MetricData]:
+        target = self._resolve_target()
+        self._ensure_capture_target(target)
+        metric = self._build_metric(context, target)
+        return [metric]
+
+    def shutdown(self):
+        self._stop_event.set()
+        self._ensure_capture_target(None)
+
+    def _discover_presentmon_exe(self) -> Optional[str]:
+        configured_path = getattr(self.config, "executable_path", None)
+        candidates = [
+            configured_path,
+            os.environ.get("PRESENTMON_EXE"),
+            os.path.join(
+                os.environ.get("ProgramFiles", ""),
+                "Intel",
+                "PresentMon",
+                "PresentMonApplication",
+                "PresentMon.exe",
+            ),
+            os.path.join(os.environ.get("ProgramFiles", ""), "PresentMon", "PresentMon.exe"),
+            os.path.join(os.getcwd(), "PresentMon.exe"),
+            shutil.which("PresentMon.exe"),
         ]
-        self._pm_api_lib.pmPollDynamicQuery.restype = ctypes.c_uint32
-        self._pm_api_lib.pmPollDynamicQuery.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32)
-        ]
-        self._pm_api_lib.pmStartTrackingProcess.restype = ctypes.c_uint32
-        self._pm_api_lib.pmStopTrackingProcess.restype = ctypes.c_uint32
-
-    def _register_queries(self) -> bool:
-        """
-        Rejestruje 3 dynamiczne zapytania rzucane na serwer Intela.
-        PM wylicza z nich agresywne natywne statystyki we własnym wątku backendu.
-        """
-        # --- Zapytanie dla Okna Bieżącego: 1 sekunda (Instant FPS / Frametime Avg / Lag) ---
-        q1_def = [
-            (PM_METRIC_DISPLAYED_FPS, PM_STAT_AVG, "fps_now"),
-            (PM_METRIC_PRESENTED_FRAME_TIME, PM_STAT_AVG, "frametime_ms_now"),
-            (PM_METRIC_CPU_BUSY, PM_STAT_AVG, "cpu_busy_ms"),
-            (PM_METRIC_GPU_BUSY, PM_STAT_AVG, "gpu_busy_ms"),
-            (PM_METRIC_DISPLAY_LATENCY, PM_STAT_AVG, "display_latency_ms"),
-            (PM_METRIC_PRESENT_MODE, PM_STAT_NONE, "present_mode") # (Hardware Composed Independent Flip itd...) Mode 20 doesnt usually need stat but we ask for ANY enum val
-        ]
-        self._query_1s, self._layout_1s, self._blob_1s = self._build_single_query(q1_def, window_ms=1000.0)
-
-        # --- Zapytanie dla Okna Agregacyjnego 10-sekundowego ---
-        q2_def = [
-            (PM_METRIC_DISPLAYED_FPS, PM_STAT_AVG, "fps_avg_10s"),
-        ]
-        self._query_10s, self._layout_10s, self._blob_10s = self._build_single_query(q2_def, window_ms=10000.0)
-
-        # --- Zapytanie dla Okna Agregacyjnego 30-sekundowego (do wykresów Long Term) ---
-        q3_def = [
-            (PM_METRIC_DISPLAYED_FPS, PM_STAT_AVG, "fps_avg_30s"),
-            (PM_METRIC_DISPLAYED_FPS, PM_STAT_PERCENTILE_01, "fps_1pct_30s"), # Intela natywne 1% lows. Native 0.1% lows are missing
-        ]
-        self._query_30s, self._layout_30s, self._blob_30s = self._build_single_query(q3_def, window_ms=30000.0)
-
-        if not self._query_1s or not self._query_10s or not self._query_30s:
-            logger.error("Rejestracja zapytań dynamicznych w PM Serwis odrzucona.")
-            return False
-            
-        return True
-
-    def _build_single_query(self, raw_specs, window_ms: float):
-        num_metrics = len(raw_specs)
-        elements = (PM_QUERY_ELEMENT * num_metrics)()
-        for i, (metric, stat, key_name) in enumerate(raw_specs):
-            elements[i].metric = metric
-            elements[i].stat = stat
-            elements[i].deviceId = 0
-            elements[i].arrayIndex = 0
-
-        query_handle = ctypes.c_void_p()
-        status = self._pm_api_lib.pmRegisterDynamicQuery(
-            self._session_handle, 
-            ctypes.byref(query_handle), 
-            elements, 
-            num_metrics, 
-            ctypes.c_double(window_ms), 
-            ctypes.c_double(0.0)
-        )
-
-        if status != PM_STATUS_SUCCESS:
-            logger.error(f"Zapytanie dynamiczne PM (okno {window_ms}ms) zawiodło: status={status}")
-            return None, [], None
-
-        layout = []
-        for i in range(num_metrics):
-            sz = elements[i].dataSize
-            # Enum has 4 bytes mostly, double has 8 bytes
-            layout.append({
-                "key": raw_specs[i][2],
-                "offset": elements[i].dataOffset,
-                "size": sz, 
-                "is_enum": raw_specs[i][0] == PM_METRIC_PRESENT_MODE
-            })
-
-        max_size = 4096  # Wystarczająco dla kilkunastu swapchainów po offsety do 32-128B
-        blob_buffer = (ctypes.c_uint8 * max_size)()
-
-        return query_handle, layout, blob_buffer
-
-    # --- Posiadanie Aktywnego Procesu (Target resolution) ---
-
-    def _resolve_target_pid(self) -> Optional[int]:
-        """Rozwiązuje PID w zależności od polityki (własny proces docelowy albo całe otwarte okno na przodzie)."""
-        if self.config.target_mode == "explicit_pid":
-            pid = self.config.process_id
-            return pid if pid and pid > 0 else None
-
-        elif self.config.target_mode == "explicit_process_name":
-            name = self.config.process_name
-            if not name:
-                return None
-            return self._find_process_by_name(name)
-
-        elif self.config.target_mode == "active_foreground":
-            return self._get_foreground_pid()
-
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
         return None
 
-    def _find_process_by_name(self, name: str) -> Optional[int]:
-        try:
-            import psutil
-            name_lower = name.lower()
-            for p in psutil.process_iter(["name", "pid"]):
-                if p.info.get("name") and p.info["name"].lower() == name_lower:
-                    return p.info["pid"]
-        except Exception:
-            pass
+    def _resolve_target(self) -> Optional[PresentMonTarget]:
+        target_mode = (self.config.target_mode or "active_foreground").strip().lower()
+
+        if target_mode in {"explicit_pid", "explicit_process_id"}:
+            pid = int(getattr(self.config, "process_id", 0) or 0)
+            if pid <= 0:
+                return None
+            return PresentMonTarget(
+                mode=target_mode,
+                filter_kind="process_id",
+                filter_value=str(pid),
+                pid=pid,
+                process_name=self._get_process_name(pid),
+            )
+
+        if target_mode == "explicit_process_name":
+            process_name = (getattr(self.config, "process_name", "") or "").strip()
+            if not process_name:
+                return None
+            pid = self._find_process_by_name(process_name) or 0
+            return PresentMonTarget(
+                mode=target_mode,
+                filter_kind="process_name",
+                filter_value=process_name,
+                pid=pid,
+                process_name=process_name,
+            )
+
+        if target_mode == "active_foreground":
+            pid = self._get_foreground_pid()
+            if not pid:
+                return None
+            return PresentMonTarget(
+                mode=target_mode,
+                filter_kind="process_id",
+                filter_value=str(pid),
+                pid=pid,
+                process_name=self._get_process_name(pid),
+            )
+
+        logger.debug("PresentMon target_mode '%s' is not supported.", target_mode)
+        return None
+
+    def _find_process_by_name(self, process_name: str) -> Optional[int]:
+        process_name = process_name.lower()
+        for process in psutil.process_iter(["name", "pid"]):
+            try:
+                name = (process.info.get("name") or "").lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if name == process_name:
+                return process.info["pid"]
         return None
 
     def _get_process_name(self, pid: int) -> str:
+        if pid <= 0:
+            return "unknown"
         try:
-            import psutil
             return psutil.Process(pid).name()
-        except Exception:
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
             return "unknown"
 
     def _get_foreground_pid(self) -> Optional[int]:
+        if win32gui is None or win32process is None:
+            return None
         try:
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
+            hwnd = win32gui.GetForegroundWindow()
             if not hwnd:
                 return None
-            pid = ctypes.wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            return pid.value if pid.value else None
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return pid or None
         except Exception:
             return None
 
-    def _ensure_process_tracking(self, pid: int):
-        """Intel PresentMon musi zostać włączony celowo dla tego procesu, aby zbierać ostre buffory"""
-        if self._active_pid != pid:
-            if self._active_pid is not None:
-                logger.debug(f"Odpinam tracking ze starego PID: {self._active_pid}")
-                self._pm_api_lib.pmStopTrackingProcess(self._session_handle, ctypes.c_uint32(self._active_pid))
-                self._active_pid = None
-                self._active_process_name = None
-            
-            logger.debug(f"Zapinam intelowski telemetryczny strumień trackingowy pod PID: {pid}")
-            st = self._pm_api_lib.pmStartTrackingProcess(self._session_handle, ctypes.c_uint32(pid))
-            if st == PM_STATUS_SUCCESS:
-                self._active_pid = pid
-                self._active_process_name = self._get_process_name(pid)
-            else:
-                logger.debug(f"pmStartTrackingProcess odmówił status {st} dla PID {pid}.")
+    def _ensure_capture_target(self, target: Optional[PresentMonTarget]):
+        with self._process_lock:
+            if self._targets_match(self._active_target, target) and self._process_running():
+                return
 
-    # --- Generowanie Logiki Agregatywnej ---
+            if self._active_target and target and self._active_target.key != target.key:
+                logger.debug(
+                    "PresentMon target switch: %s (%s) -> %s (%s)",
+                    self._active_target.process_name,
+                    self._active_target.filter_value,
+                    target.process_name,
+                    target.filter_value,
+                )
+            elif self._active_target and target is None:
+                logger.debug(
+                    "PresentMon target cleared: %s (%s)",
+                    self._active_target.process_name,
+                    self._active_target.filter_value,
+                )
+            elif target and not self._active_target:
+                logger.debug(
+                    "PresentMon target acquired: %s (%s)",
+                    target.process_name,
+                    target.filter_value,
+                )
 
-    def _run_query_extract(self, query, blob_buf, layout, pid) -> dict:
-        """Odpytuje konkretne okno dynamiczne i rozwiązuje wskazane w nim pola bitowe do dict."""
-        num_swap_chains = ctypes.c_uint32(10) # Out param na faktyczną liczbę swapchainów buforowanych na blobie
-        
-        status = self._pm_api_lib.pmPollDynamicQuery(
-            query, 
-            ctypes.c_uint32(pid), 
-            blob_buf, 
-            ctypes.byref(num_swap_chains)
+            self._stop_capture_locked()
+            self._active_target = target
+            self._last_capture_error = None
+
+            if target is not None:
+                self._start_capture_locked(target)
+
+    def _targets_match(
+        self,
+        left: Optional[PresentMonTarget],
+        right: Optional[PresentMonTarget],
+    ) -> bool:
+        return left == right
+
+    def _process_running(self) -> bool:
+        return self._capture_process is not None and self._capture_process.poll() is None
+
+    def _start_capture_locked(self, target: PresentMonTarget):
+        if not self._exe_path:
+            return
+
+        command = self._build_command(target)
+        self._reader_generation += 1
+        generation = self._reader_generation
+
+        logger.debug("PresentMon launch command: %s", subprocess.list2cmdline(command))
+
+        creationflags = CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            self._capture_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                universal_newlines=True,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            self._last_capture_error = str(exc)
+            logger.error("PresentMon subprocess failed to start: %s", exc)
+            self._capture_process = None
+            return
+
+        logger.debug("PresentMon subprocess started. pid=%s", self._capture_process.pid)
+
+        self._stdout_thread = threading.Thread(
+            target=self._stdout_reader_loop,
+            args=(self._capture_process, generation),
+            name=f"PresentMon-stdout-{generation}",
+            daemon=True,
         )
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_reader_loop,
+            args=(self._capture_process, generation),
+            name=f"PresentMon-stderr-{generation}",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
 
-        if status != PM_STATUS_SUCCESS or num_swap_chains.value == 0:
-            return {}
+    def _stop_capture_locked(self):
+        process = self._capture_process
+        stdout_thread = self._stdout_thread
+        stderr_thread = self._stderr_thread
 
-        out = {}
-        sc_idx = 0 # W przypadku wielu swapchainów bierzemy główny domyślny pod indeksem 0
-        for lay in layout:
-            key = lay["key"]
-            off = lay["offset"]
-            size = lay["size"]
-            is_enum = lay["is_enum"]
-            
-            data_ptr = ctypes.addressof(blob_buf) + off + sc_idx * 1024 # Note blob block spacing isn't perfectly mapped without struct sizes, but for 1 SC its always offset 0 blocks
-            # Domyślnie używamy precyzyjnego Double (8 batjów) do FPS / MS Latency
-            if is_enum or size == 4:
-                val = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value
-                out[key] = round(float(val), 2)
-            else:
-                val = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_double)).contents.value
-                out[key] = round(float(val), 2) if key not in ["present_mode"] else float(val)
+        self._capture_process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
 
-        return out
+        if process is None:
+            return
 
-    def _collect(self, context: ProviderContext) -> List[MetricData]:
-        if not self._pm_api_lib:
-            return []
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+        except Exception as exc:
+            logger.debug("PresentMon subprocess stop error: %s", exc)
+        finally:
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
 
-        pid = self._resolve_target_pid()
-        if not pid:
-            return []
+        if stdout_thread:
+            stdout_thread.join(timeout=1)
+        if stderr_thread:
+            stderr_thread.join(timeout=1)
 
-        # Wyrzuca komendy start / stop śledzenia
-        self._ensure_process_tracking(pid)
+    def _build_command(self, target: PresentMonTarget) -> List[str]:
+        command = [
+            self._exe_path or "PresentMon.exe",
+            "--output_stdout",
+            "--no_console_stats",
+            "--stop_existing_session",
+            "--session_name",
+            f"ByteTechAgent-{os.getpid()}",
+        ]
 
-        # Trzeba mieć aktywny tracker processowy żeby uzyskać jakiekolwiek zapytanie z bufora usługi
-        if not self._active_pid:
-            return []
+        if target.filter_kind == "process_id":
+            command.extend(["--process_id", target.filter_value])
+            command.append("--terminate_on_proc_exit")
+        else:
+            command.extend(["--process_name", target.filter_value])
 
-        # Pompujemy dane ze wszystkich zarejestrowanych okien w usłudze
-        dict_1s = self._run_query_extract(self._query_1s, self._blob_1s, self._layout_1s, pid)
-        # Tylko z 1s wymagamy obecności jakichś renderujących danych by kontynowować emisję rekordu (brak pustych logów idle)
-        if not dict_1s or dict_1s.get("fps_now", 0.0) <= 0.0:
-            return []
+        return command
 
-        dict_10s = self._run_query_extract(self._query_10s, self._blob_10s, self._layout_10s, pid)
-        dict_30s = self._run_query_extract(self._query_30s, self._blob_30s, self._layout_30s, pid)
+    def _stdout_reader_loop(self, process: subprocess.Popen, generation: int):
+        parser = PresentMonCsvParser()
+        startup_lines_logged = 0
 
-        # Scalanie końcowych wskaźników do paczki
-        fields = {}
-        fields.update(dict_1s)
-        fields.update(dict_10s)
-        fields.update(dict_30s)
+        if not process.stdout:
+            return
 
-        # Dołączenie identyfikatorów gry tak aby backend w Influx i grafanie widział do kogo należa klatki
+        for raw_line in process.stdout:
+            if generation != self._reader_generation:
+                break
+
+            line = raw_line.rstrip("\r\n")
+            if startup_lines_logged < STARTUP_LINE_LOG_LIMIT:
+                logger.debug("PresentMon stdout[%s]: %s", startup_lines_logged + 1, line)
+                startup_lines_logged += 1
+
+            try:
+                sample = parser.parse_line(line)
+            except Exception as exc:
+                logger.debug("PresentMon stdout parser error: %s | line=%r", exc, line)
+                continue
+
+            if sample is None:
+                continue
+
+            with self._stats_lock:
+                stats = self._stats_by_pid.get(sample.pid)
+                if stats is None:
+                    stats = RollingProcessStats(sample.pid, sample.process_name)
+                    self._stats_by_pid[sample.pid] = stats
+                stats.add_sample(sample)
+                self._records_processed += 1
+                if self._records_processed % RECORD_LOG_INTERVAL == 0:
+                    logger.debug(
+                        "PresentMon processed frame-level records=%s",
+                        self._records_processed,
+                    )
+
+    def _stderr_reader_loop(self, process: subprocess.Popen, generation: int):
+        startup_lines_logged = 0
+        if not process.stderr:
+            return
+
+        for raw_line in process.stderr:
+            if generation != self._reader_generation:
+                break
+            line = raw_line.rstrip("\r\n")
+            if startup_lines_logged < STARTUP_LINE_LOG_LIMIT:
+                logger.debug("PresentMon stderr[%s]: %s", startup_lines_logged + 1, line)
+                startup_lines_logged += 1
+            elif line:
+                logger.debug("PresentMon stderr: %s", line)
+
+    def _build_metric(
+        self,
+        context: ProviderContext,
+        target: Optional[PresentMonTarget],
+    ) -> MetricData:
+        snapshot = self._snapshot_for_target(target)
+
+        reason = snapshot.get("reason", "ok")
+        process_name = snapshot.get("process_name") or (target.process_name if target else "unknown")
+        pid = int(snapshot.get("pid") or (target.pid if target else 0) or 0)
+
+        fields = {
+            "fps_now": float(snapshot.get("fps_now", 0.0)),
+            "frametime_ms_now": float(snapshot.get("frametime_ms_now", 0.0)),
+            "fps_avg_10s": float(snapshot.get("fps_avg_10s", 0.0)),
+            "fps_avg_30s": float(snapshot.get("fps_avg_30s", 0.0)),
+            "fps_1pct_30s": float(snapshot.get("fps_1pct_30s", 0.0)),
+            "fps_0_1pct_30s": float(snapshot.get("fps_0_1pct_30s", 0.0)),
+        }
+
+        for optional_field in ("cpu_busy_ms", "gpu_busy_ms", "display_latency_ms"):
+            value = snapshot.get(optional_field)
+            if value is not None:
+                fields[optional_field] = float(value)
+
+        present_mode = snapshot.get("present_mode")
+        if present_mode:
+            fields["present_mode"] = present_mode
+
         tags = {
             "host": context.host_alias,
-            "process_name": self._active_process_name or "unknown",
+            "process_name": process_name,
             "pid": str(pid),
-            "app_mode": self.config.target_mode,
-            "backend": "presentmon_v2_api",
+            "app_mode": (self.config.target_mode or "active_foreground"),
+            "backend": BACKEND_NAME,
         }
-        
-        fields["process_id"] = pid
 
-        return [MetricData(measurement_name="pc_fps", tags=tags, fields=fields)]
+        logger.debug(
+            "PresentMon metric values before MetricData: reason=%s fields=%s tags=%s",
+            reason,
+            fields,
+            tags,
+        )
 
-    def shutdown(self):
-        if self._pm_api_lib:
-            if self._active_pid:
-                try:
-                    self._pm_api_lib.pmStopTrackingProcess(self._session_handle, ctypes.c_uint32(self._active_pid))
-                except Exception:
-                    pass
-            for q in filter(None, [self._query_1s, self._query_10s, self._query_30s]):
-                try:
-                    self._pm_api_lib.pmFreeDynamicQuery(q)
-                except Exception:
-                    pass
+        if reason != "ok":
+            logger.debug("PresentMon sending zero/default metric because: %s", reason)
 
-            if self._session_handle:
-                try:
-                    self._pm_api_lib.pmCloseSession(self._session_handle)
-                except Exception:
-                    pass
-            
-            self._session_handle = ctypes.c_void_p()
-            self._pm_api_lib = None
+        return MetricData(measurement_name="pc_fps", tags=tags, fields=fields)
+
+    def _snapshot_for_target(self, target: Optional[PresentMonTarget]) -> Dict[str, object]:
+        now = time.monotonic()
+        with self._stats_lock:
+            self._prune_stale_stats(now)
+
+            if target is None:
+                return {"reason": "no_target", "process_name": "unknown", "pid": 0}
+
+            if self._last_capture_error:
+                return {
+                    "reason": f"capture_start_failed: {self._last_capture_error}",
+                    "process_name": target.process_name,
+                    "pid": target.pid,
+                }
+
+            stats = self._select_stats_for_target(target, now)
+            if stats is None:
+                return {
+                    "reason": "no_samples_for_target",
+                    "process_name": target.process_name,
+                    "pid": target.pid,
+                }
+
+            snapshot = stats.snapshot(now)
+            snapshot["process_name"] = stats.process_name or target.process_name
+            snapshot["pid"] = stats.pid or target.pid
+
+            if snapshot["sample_count_30s"] == 0:
+                snapshot["reason"] = "target_has_no_recent_frames"
+            else:
+                snapshot["reason"] = "ok"
+            return snapshot
+
+    def _select_stats_for_target(
+        self,
+        target: PresentMonTarget,
+        now: float,
+    ) -> Optional[RollingProcessStats]:
+        if target.filter_kind == "process_id":
+            stats = self._stats_by_pid.get(target.pid)
+            if stats and stats.has_recent_samples(now):
+                return stats
+            return None
+
+        candidates = [
+            stats for stats in self._stats_by_pid.values()
+            if stats.process_name.lower() == target.process_name.lower() and stats.has_recent_samples(now)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda stats: stats.last_sample_monotonic or 0.0)
+
+    def _prune_stale_stats(self, now: float):
+        stale_pids = [
+            pid for pid, stats in self._stats_by_pid.items()
+            if not stats.has_recent_samples(now, max_age_seconds=WINDOW_30S_SECONDS)
+        ]
+        for pid in stale_pids:
+            del self._stats_by_pid[pid]

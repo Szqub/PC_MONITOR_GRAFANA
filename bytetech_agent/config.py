@@ -43,6 +43,7 @@ class PresentMonConfig(BaseModel):
     target_mode: str = "active_foreground"
     process_name: Optional[str] = None
     process_id: Optional[int] = None
+    executable_path: Optional[str] = None
 
 
 class LoggingConfig(BaseModel):
