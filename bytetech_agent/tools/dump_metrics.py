@@ -49,7 +49,7 @@ def dump_schema():
         providers.append(NvapiProvider())
         
     if config.providers.fps_enabled:
-        providers.append(FpsProvider(config.fps, config.rtss, config.presentmon))
+        providers.append(FpsProvider(config.fps, config.rtss, config.presentmon, config.presentmon_service))
         
     if config.providers.display_provider_enabled:
         providers.append(DisplayProvider())

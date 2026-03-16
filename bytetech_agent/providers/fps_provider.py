@@ -1,4 +1,4 @@
-"""FPS backend router for RTSS primary backend and optional PresentMon fallback."""
+"""FPS backend router for PresentMon Service API primary backend and optional fallbacks."""
 from __future__ import annotations
 
 import logging
@@ -7,17 +7,19 @@ from typing import List, Optional
 from bytetech_agent.models.metrics import MetricData, ProviderContext, ProviderStatus
 from bytetech_agent.providers.base import BaseProvider
 from bytetech_agent.providers.presentmon_provider import PresentMonProvider
+from bytetech_agent.providers.presentmon_service_provider import PresentMonServiceProvider
 from bytetech_agent.providers.rtss_provider import RtssProvider
 
 logger = logging.getLogger(__name__)
 
 
 class FpsProvider(BaseProvider):
-    def __init__(self, fps_config, rtss_config, presentmon_config):
+    def __init__(self, fps_config, rtss_config, presentmon_config, presentmon_service_config):
         super().__init__(name="FPS")
         self._fps_config = fps_config
         self._rtss_config = rtss_config
         self._presentmon_config = presentmon_config
+        self._presentmon_service_config = presentmon_service_config
         self._primary = self._build_backend(fps_config.backend)
         self._fallback = self._build_backend(fps_config.fallback_backend) if fps_config.fallback_backend else None
 
@@ -66,6 +68,12 @@ class FpsProvider(BaseProvider):
             self._fallback.shutdown()
 
     def _build_backend(self, backend_name: Optional[str]) -> BaseProvider:
+        if backend_name == "presentmon_service_api":
+            return PresentMonServiceProvider(
+                self._fps_config,
+                self._presentmon_config,
+                self._presentmon_service_config,
+            )
         if backend_name == "presentmon_console":
             return PresentMonProvider(self._presentmon_config)
         return RtssProvider(self._fps_config, self._rtss_config, self._presentmon_config)

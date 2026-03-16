@@ -6,9 +6,9 @@ Architecture:
 
 `Windows Agent -> InfluxDB 2.x -> Grafana`
 
-The project now uses RTSS shared memory as the primary production FPS backend.
-Standalone PresentMon console remains available only as an optional fallback,
-diagnostic, or benchmark-oriented backend.
+The project now uses the installed PresentMon Service API as the primary production FPS backend.
+Standalone PresentMon console remains available as an optional fallback and
+diagnostic backend, while RTSS remains an optional legacy/fallback backend.
 
 ---
 
@@ -20,19 +20,24 @@ ByteTech Agent collects:
 
 - hardware telemetry from LibreHardwareMonitor and NVML
 - system and display state from Windows and `psutil`
-- FPS telemetry from RTSS shared memory
+- FPS telemetry from the installed PresentMon Service API
 - optional fallback FPS telemetry from standalone PresentMon console
+- optional legacy/fallback FPS telemetry from RTSS shared memory
 - provider and agent health metrics
 
 ### FPS Backend Architecture
 
 Primary production backend:
 
-- `rtss_shared_memory`
+- `presentmon_service_api`
 
 Optional fallback / diagnostics:
 
 - `presentmon_console`
+
+Optional legacy/fallback backend:
+
+- `rtss_shared_memory`
 
 Not used as production path:
 
@@ -40,17 +45,12 @@ Not used as production path:
 - CSV files on disk
 - screen scraping / OCR / overlay capture
 
-### Why RTSS Is Now Primary
+### Why PresentMon Service API Is Primary
 
-PresentMon-based live collection was demoted because on the tested host it did not provide reliable production-grade live data. RTSS shared memory is now preferred because it exposes live framerate statistics with low operational complexity.
-
-Trade-off:
-
-- RTSS provides good live telemetry for `fps_now` and `frametime_ms_now`
-- rolling 10s / 30s averages are calculated locally in the agent
-- `fps_1pct_30s` and `fps_0_1pct_30s` are sampled approximations from RTSS polling, not raw frame-event percentiles from a full trace
-
-That limitation is intentional and documented. It is not hidden.
+PresentMon Service is now the preferred live telemetry path because it is the
+official integration point for installed PresentMon deployments. The agent
+dynamically loads the host-installed API DLL and connects as another service
+client without launching a separate capture process.
 
 ### Main Measurements
 
@@ -89,6 +89,7 @@ Optional fields:
 
 Current backend tag values:
 
+- `presentmon_service_api`
 - `rtss_shared_memory`
 - `presentmon_console_stdout`
 
@@ -96,12 +97,17 @@ Current backend tag values:
 
 ```yaml
 fps:
-  backend: "rtss_shared_memory"
-  fallback_backend: ""
+  backend: "presentmon_service_api"
+  fallback_backend: "presentmon_console"
 
-rtss:
-  shared_memory_name: "RTSSSharedMemoryV2"
-  stale_timeout_ms: 2000
+presentmon_service:
+  enabled: true
+  sdk_path: ""
+  api_loader_dll: ""
+  api_runtime_dll: ""
+  service_dir: ""
+  connect_timeout_ms: 3000
+  poll_interval_ms: 250
 
 presentmon:
   target_mode: "active_foreground"
@@ -112,10 +118,21 @@ presentmon:
 
 Notes:
 
-- default backend is `rtss_shared_memory`
+- default backend is `presentmon_service_api`
 - `fallback_backend` is optional and can be `presentmon_console`
 - `active_foreground` remains the default production target mode
 - `explicit_process_name` and `explicit_process_id` remain diagnostic modes
+- the GUI `PresentMonApplication\PresentMon.exe` path is not the API integration point
+
+### PresentMon Service API Requirements
+
+The agent discovers actual API DLL files and prefers:
+
+1. explicit configured paths
+2. environment overrides
+3. `C:\Program Files\Intel\PresentMon\SDK`
+4. detected service-side installation directories
+5. PATH as a last resort
 
 ### RTSS Requirements
 
@@ -162,8 +179,9 @@ If a GUI `PresentMonApplication` path is configured, the provider logs a clear e
 
 The installer now assumes:
 
-- RTSS is the default FPS backend
-- standalone PresentMon is optional
+- PresentMon Service API is the default FPS backend
+- standalone PresentMon console is optional fallback
+- RTSS is optional legacy fallback
 - standalone PresentMon should live at `C:\ByteTechAgent\bin\PresentMon.exe`
 
 If PresentMon fallback is enabled, the installer:
@@ -224,12 +242,11 @@ pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\te
 No FPS in Grafana:
 
 1. Check `backend` tag in `pc_fps`.
-2. Confirm RTSS is running.
-3. Confirm RTSS shared memory is available.
-4. Run `python -m bytetech_agent.tools.rtss_probe` and inspect the raw `kept` / `rejected` decisions per app entry.
-5. Confirm the game is the active foreground target when using `active_foreground`.
-6. If using PresentMon fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
-7. If RTSS initializes as healthy but still returns zero metrics, inspect `rtss_provider` DEBUG output before suspecting the scheduler, Influx writer, or Grafana.
+2. If using `presentmon_service_api`, confirm the PresentMon API DLLs were discovered and the service is already installed on the host.
+3. Confirm the game is the active foreground target when using `active_foreground`.
+4. If using RTSS fallback, confirm RTSS is running and shared memory is available.
+5. If using PresentMon console fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
+6. Inspect DEBUG logs for the selected backend before suspecting the scheduler, Influx writer, or Grafana.
 
 Example Flux check:
 
@@ -238,7 +255,7 @@ from(bucket: "metrics")
   |> range(start: -10m)
   |> filter(fn: (r) => r["_measurement"] == "pc_fps")
   |> filter(fn: (r) => r["_field"] == "fps_now")
-  |> filter(fn: (r) => r["backend"] == "rtss_shared_memory" or r["backend"] == "presentmon_console_stdout")
+  |> filter(fn: (r) => r["backend"] == "presentmon_service_api" or r["backend"] == "rtss_shared_memory" or r["backend"] == "presentmon_console_stdout")
 ```
 
 ---

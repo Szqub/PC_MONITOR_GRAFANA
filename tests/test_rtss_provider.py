@@ -242,11 +242,20 @@ class StubMetricsProvider(BaseProvider):
 
 def test_fps_router_uses_fallback_when_primary_returns_no_metrics():
     router = FpsProvider(
-        fps_config=SimpleNamespace(backend="rtss_shared_memory", fallback_backend="presentmon_console"),
+        fps_config=SimpleNamespace(backend="presentmon_service_api", fallback_backend="presentmon_console"),
         rtss_config=SimpleNamespace(shared_memory_name="RTSSSharedMemoryV2", stale_timeout_ms=2000),
         presentmon_config=SimpleNamespace(target_mode="active_foreground", process_name=None, process_id=None),
+        presentmon_service_config=SimpleNamespace(
+            enabled=True,
+            sdk_path=None,
+            api_loader_dll=None,
+            api_runtime_dll=None,
+            service_dir=None,
+            poll_interval_ms=250,
+            connect_timeout_ms=3000,
+        ),
     )
-    router._primary = StubMetricsProvider(name="RTSS", metrics=[])
+    router._primary = StubMetricsProvider(name="PresentMonService", metrics=[])
     router._fallback = StubMetricsProvider(
         name="PresentMon",
         metrics=[

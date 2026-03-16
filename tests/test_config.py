@@ -12,6 +12,7 @@ from bytetech_agent.config import (
     TimingConfig,
     ProvidersConfig,
     PresentMonConfig,
+    PresentMonServiceConfig,
     RtssConfig,
     LoggingConfig,
     BufferConfig,
@@ -130,13 +131,21 @@ class TestPresentMonConfig:
 class TestFpsConfig:
     def test_defaults(self):
         cfg = FpsConfig()
-        assert cfg.backend == "rtss_shared_memory"
-        assert cfg.fallback_backend is None
+        assert cfg.backend == "presentmon_service_api"
+        assert cfg.fallback_backend == "presentmon_console"
 
     def test_normalizes_aliases(self):
         cfg = FpsConfig(backend="rtss", fallback_backend="presentmon")
         assert cfg.backend == "rtss_shared_memory"
         assert cfg.fallback_backend == "presentmon_console"
+
+
+class TestPresentMonServiceConfig:
+    def test_defaults(self):
+        cfg = PresentMonServiceConfig()
+        assert cfg.enabled is True
+        assert cfg.poll_interval_ms == 250
+        assert cfg.connect_timeout_ms == 3000
 
 
 class TestRtssConfig:

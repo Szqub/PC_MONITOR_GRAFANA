@@ -85,19 +85,20 @@ class PresentMonConfig(BaseModel):
 
 
 class FpsConfig(BaseModel):
-    backend: str = "rtss_shared_memory"
-    fallback_backend: Optional[str] = None
+    backend: str = "presentmon_service_api"
+    fallback_backend: Optional[str] = "presentmon_console"
 
     @field_validator("backend", mode="before")
     @classmethod
     def _normalize_backend(cls, value):
-        normalized = str(value or "rtss_shared_memory").strip().lower()
+        normalized = str(value or "presentmon_service_api").strip().lower()
         aliases = {
             "rtss": "rtss_shared_memory",
             "presentmon": "presentmon_console",
+            "presentmon_service": "presentmon_service_api",
         }
         normalized = aliases.get(normalized, normalized)
-        allowed = {"rtss_shared_memory", "presentmon_console"}
+        allowed = {"presentmon_service_api", "rtss_shared_memory", "presentmon_console"}
         if normalized not in allowed:
             raise ValueError(f"Unsupported fps.backend: {value!r}")
         return normalized
@@ -111,9 +112,10 @@ class FpsConfig(BaseModel):
         aliases = {
             "presentmon": "presentmon_console",
             "rtss": "rtss_shared_memory",
+            "presentmon_service": "presentmon_service_api",
         }
         normalized = aliases.get(normalized, normalized)
-        allowed = {"rtss_shared_memory", "presentmon_console"}
+        allowed = {"presentmon_service_api", "rtss_shared_memory", "presentmon_console"}
         if normalized not in allowed:
             raise ValueError(f"Unsupported fps.fallback_backend: {value!r}")
         return normalized
@@ -134,6 +136,22 @@ class RtssConfig(BaseModel):
     def _normalize_stale_timeout_ms(cls, value):
         normalized = int(value or 2000)
         return max(250, normalized)
+
+
+class PresentMonServiceConfig(BaseModel):
+    enabled: bool = True
+    sdk_path: Optional[str] = None
+    api_loader_dll: Optional[str] = None
+    api_runtime_dll: Optional[str] = None
+    service_dir: Optional[str] = None
+    connect_timeout_ms: int = 3000
+    poll_interval_ms: int = 250
+
+    @field_validator("connect_timeout_ms", "poll_interval_ms", mode="before")
+    @classmethod
+    def _normalize_positive_int(cls, value):
+        normalized = int(value or 0)
+        return max(100, normalized)
 
 
 class LoggingConfig(BaseModel):
@@ -166,6 +184,7 @@ class AppConfig(BaseModel):
     lhm: LhmConfig = Field(default_factory=LhmConfig)
     rtss: RtssConfig = Field(default_factory=RtssConfig)
     presentmon: PresentMonConfig = Field(default_factory=PresentMonConfig)
+    presentmon_service: PresentMonServiceConfig = Field(default_factory=PresentMonServiceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     options: OptionsConfig = Field(default_factory=OptionsConfig)

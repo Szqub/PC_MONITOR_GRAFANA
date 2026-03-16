@@ -17,8 +17,8 @@ timing:
   fps_interval_sec: 1
 
 fps:
-  backend: "rtss_shared_memory"
-  fallback_backend: ""
+  backend: "presentmon_service_api"
+  fallback_backend: "presentmon_console"
 
 providers:
   lhm_enabled: true
@@ -46,6 +46,15 @@ presentmon:
   process_name: ""
   process_id: 0
   executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
+
+presentmon_service:
+  enabled: true
+  sdk_path: ""
+  api_loader_dll: ""
+  api_runtime_dll: ""
+  service_dir: ""
+  connect_timeout_ms: 3000
+  poll_interval_ms: 250
 
 logging:
   level: "INFO"

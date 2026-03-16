@@ -58,6 +58,36 @@ function Select-ExistingFile($title) {
     return ""
 }
 
+function Find-PresentMonApiFiles() {
+    $programFiles = $env:ProgramFiles
+    $candidateDirs = @(
+        "$programFiles\Intel\PresentMon\SDK",
+        "$programFiles\Intel\PresentMon",
+        "$programFiles\Intel\PresentMonSharedService",
+        "$programFiles\Intel\PresentMonSharedServices"
+    )
+
+    $result = @{
+        SdkDir = ""
+        ServiceDir = ""
+        LoaderDll = ""
+        RuntimeDll = ""
+    }
+
+    foreach ($dir in $candidateDirs) {
+        if (-not (Test-Path -Path $dir)) { continue }
+        if (-not $result.SdkDir -and $dir -like "*\SDK") { $result.SdkDir = $dir }
+        if (-not $result.ServiceDir -and $dir -like "*PresentMonSharedService*") { $result.ServiceDir = $dir }
+
+        $loaderDll = Join-Path $dir "PresentMonAPI2Loader.dll"
+        $runtimeDll = Join-Path $dir "PresentMonAPI2.dll"
+        if (-not $result.LoaderDll -and (Test-Path -Path $loaderDll)) { $result.LoaderDll = $loaderDll }
+        if (-not $result.RuntimeDll -and (Test-Path -Path $runtimeDll)) { $result.RuntimeDll = $runtimeDll }
+    }
+
+    return $result
+}
+
 # Status tracking
 $status = @{
     config_generated = $false
@@ -232,11 +262,12 @@ if ($needsConfig) {
 
     Write-Host ""
     Write-Host "  FPS backend selection:" -ForegroundColor White
-    $fps_backend = Read-Host "    FPS backend (default rtss_shared_memory)"
-    if (-not $fps_backend) { $fps_backend = "rtss_shared_memory" }
+    $pmApiDetection = Find-PresentMonApiFiles
+    $fps_backend = Read-Host "    FPS backend (default presentmon_service_api)"
+    if (-not $fps_backend) { $fps_backend = "presentmon_service_api" }
 
-    $fps_fallback = Read-Host "    Enable PresentMon console fallback/diagnostics? (Y/N, default N)"
-    if ($fps_fallback -eq 'Y' -or $fps_fallback -eq 'y') {
+    $fps_fallback = Read-Host "    Enable PresentMon console fallback/diagnostics? (Y/N, default Y)"
+    if (-not $fps_fallback -or $fps_fallback -eq 'Y' -or $fps_fallback -eq 'y') {
         $fps_fallback_backend = "presentmon_console"
         $pm_val = "true"
     } else {
@@ -327,6 +358,15 @@ presentmon:
   process_id: 0
   executable_path: "$presentmon_final_path"
 
+presentmon_service:
+  enabled: true
+  sdk_path: "$($pmApiDetection.SdkDir)"
+  api_loader_dll: "$($pmApiDetection.LoaderDll)"
+  api_runtime_dll: "$($pmApiDetection.RuntimeDll)"
+  service_dir: "$($pmApiDetection.ServiceDir)"
+  connect_timeout_ms: 3000
+  poll_interval_ms: 250
+
 logging:
   level: "INFO"
   log_dir: "logs"
@@ -398,7 +438,19 @@ try {
 }
 
 # ========================= STEP 6: RTSS / PresentMon Check =========================
-Write-Step "6/9" "Checking RTSS and optional PresentMon fallback..."
+Write-Step "6/9" "Checking PresentMon Service API, RTSS, and optional PresentMon fallback..."
+
+$pmApiDetection = Find-PresentMonApiFiles
+if ($pmApiDetection.LoaderDll -or $pmApiDetection.RuntimeDll) {
+    Write-Ok "PresentMon Service API files detected"
+    if ($pmApiDetection.SdkDir) { Write-Info "SDK dir: $($pmApiDetection.SdkDir)" }
+    if ($pmApiDetection.LoaderDll) { Write-Info "API loader DLL: $($pmApiDetection.LoaderDll)" }
+    if ($pmApiDetection.RuntimeDll) { Write-Info "API runtime DLL: $($pmApiDetection.RuntimeDll)" }
+    if ($pmApiDetection.ServiceDir) { Write-Info "Service dir: $($pmApiDetection.ServiceDir)" }
+    $status.presentmon_detected = $true
+} else {
+    Write-Info "PresentMon Service API DLLs were not auto-detected. Agent fallback may be used if configured."
+}
 
 $rtssPaths = @(
     "${env:ProgramFiles(x86)}\RivaTuner Statistics Server\RTSS.exe",
@@ -426,7 +478,7 @@ if (Test-Path -Path $pmStandalone) {
     $status.presentmon_detected = $true
 } else {
     Write-Info "Standalone PresentMon fallback not installed in $pmStandalone"
-    Write-Info "This is optional. RTSS remains the primary FPS backend."
+    Write-Info "This is optional. PresentMon Service API remains the preferred FPS backend."
 }
 
 # ========================= STEP 7: InfluxDB Connection Test =========================

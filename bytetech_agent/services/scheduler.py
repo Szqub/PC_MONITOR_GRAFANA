@@ -74,7 +74,7 @@ class AgentScheduler:
             self._hw_providers.append(NvapiProvider())
 
         if config.providers.fps_enabled:
-            self._fps_providers.append(FpsProvider(config.fps, config.rtss, config.presentmon))
+            self._fps_providers.append(FpsProvider(config.fps, config.rtss, config.presentmon, config.presentmon_service))
 
         if config.providers.display_provider_enabled:
             self._state_providers.append(DisplayProvider())
