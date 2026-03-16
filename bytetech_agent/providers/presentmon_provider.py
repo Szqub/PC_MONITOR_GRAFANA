@@ -362,7 +362,7 @@ class PresentMonProvider(BaseProvider):
         return "presentmonapplication" in normalized
 
     def _resolve_target(self) -> Optional[PresentMonTarget]:
-        target_mode = (self.config.target_mode or "active_foreground").strip().lower()
+        target_mode = (self.config.target_mode or "smart_auto").strip().lower()
 
         if target_mode in {"explicit_pid", "explicit_process_id"}:
             pid = int(getattr(self.config, "process_id", 0) or 0)
@@ -389,7 +389,7 @@ class PresentMonProvider(BaseProvider):
                 process_name=process_name,
             )
 
-        if target_mode == "active_foreground":
+        if target_mode in {"smart_auto", "active_foreground"}:
             pid = self._get_foreground_pid()
             if not pid:
                 return None

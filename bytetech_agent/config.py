@@ -47,7 +47,7 @@ class LhmConfig(BaseModel):
 
 
 class PresentMonConfig(BaseModel):
-    target_mode: str = "active_foreground"
+    target_mode: str = "smart_auto"
     process_name: Optional[str] = None
     process_id: Optional[int] = None
     executable_path: Optional[str] = None
@@ -55,10 +55,11 @@ class PresentMonConfig(BaseModel):
     @field_validator("target_mode", mode="before")
     @classmethod
     def _normalize_target_mode(cls, value):
-        normalized = str(value or "active_foreground").strip().lower()
+        normalized = str(value or "smart_auto").strip().lower()
         if normalized == "explicit_pid":
             normalized = "explicit_process_id"
         allowed = {
+            "smart_auto",
             "active_foreground",
             "explicit_process_name",
             "explicit_process_id",

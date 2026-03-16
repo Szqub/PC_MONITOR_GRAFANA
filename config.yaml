@@ -39,10 +39,11 @@ rtss:
 
 presentmon:
   # valid values:
+  # - smart_auto
   # - active_foreground
   # - explicit_process_name
   # - explicit_process_id
-  target_mode: "active_foreground"
+  target_mode: "smart_auto"
   process_name: ""
   process_id: 0
   executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"

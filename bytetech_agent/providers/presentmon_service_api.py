@@ -51,11 +51,20 @@ class PresentMonApiPaths:
 
 @dataclass(frozen=True)
 class PresentMonApiSnapshot:
-    fps: float
+    application_fps: float
+    displayed_fps: float
     frametime_ms: float
     cpu_busy_ms: Optional[float]
     gpu_busy_ms: Optional[float]
     display_latency_ms: Optional[float]
+
+    @property
+    def fps(self) -> float:
+        return self.application_fps if self.application_fps > 0 else self.displayed_fps
+
+    @property
+    def usable(self) -> bool:
+        return self.application_fps > 0 or self.displayed_fps > 0 or self.frametime_ms > 0
 
 
 class PM_QUERY_ELEMENT(ctypes.Structure):
@@ -340,17 +349,24 @@ class PresentMonServiceApiClient:
             display_latency_us = self._read_double(blob, base + 40)
             fps = application_fps if application_fps > 0 else displayed_fps
             frametime_ms = cpu_frame_time_us / 1000.0 if cpu_frame_time_us > 0 else (1000.0 / fps if fps > 0 else 0.0)
-            samples.append(
-                PresentMonApiSnapshot(
-                    fps=round(fps, 2) if fps > 0 else 0.0,
-                    frametime_ms=round(frametime_ms, 2) if frametime_ms > 0 else 0.0,
-                    cpu_busy_ms=self._to_milliseconds(cpu_busy_us),
-                    gpu_busy_ms=self._to_milliseconds(gpu_busy_us),
-                    display_latency_ms=self._to_milliseconds(display_latency_us),
-                )
+            snapshot = PresentMonApiSnapshot(
+                application_fps=round(application_fps, 2) if application_fps > 0 else 0.0,
+                displayed_fps=round(displayed_fps, 2) if displayed_fps > 0 else 0.0,
+                frametime_ms=round(frametime_ms, 2) if frametime_ms > 0 else 0.0,
+                cpu_busy_ms=self._to_milliseconds(cpu_busy_us),
+                gpu_busy_ms=self._to_milliseconds(gpu_busy_us),
+                display_latency_ms=self._to_milliseconds(display_latency_us),
             )
+            if snapshot.usable:
+                samples.append(snapshot)
 
-        samples.sort(key=lambda sample: sample.fps, reverse=True)
+        if not samples:
+            return None
+
+        samples.sort(
+            key=lambda sample: (sample.application_fps, sample.displayed_fps, sample.frametime_ms),
+            reverse=True,
+        )
         return samples[0]
 
     def _add_dll_search_dirs(self):

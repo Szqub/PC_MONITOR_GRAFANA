@@ -110,7 +110,7 @@ presentmon_service:
   poll_interval_ms: 250
 
 presentmon:
-  target_mode: "active_foreground"
+  target_mode: "smart_auto"
   process_name: ""
   process_id: 0
   executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
@@ -120,9 +120,12 @@ Notes:
 
 - default backend is `presentmon_service_api`
 - `fallback_backend` is optional and can be `presentmon_console`
-- `active_foreground` remains the default production target mode
+- `smart_auto` is the default production target mode for PresentMon Service API
+- `smart_auto` starts from the foreground PID, inspects related parent/child processes, rejects obvious helpers/browsers/shells, and keeps the last good game PID for a short grace period after alt-tab
+- `active_foreground` remains available for backward compatibility
 - `explicit_process_name` and `explicit_process_id` remain diagnostic modes
 - the GUI `PresentMonApplication\PresentMon.exe` path is not the API integration point
+- `fps_now` maps to application FPS when PresentMon exposes it; if application FPS is unavailable, the agent falls back to displayed FPS. Raw fields `fps_application_now` and `fps_displayed_now` are also emitted.
 
 ### PresentMon Service API Requirements
 
@@ -243,7 +246,7 @@ No FPS in Grafana:
 
 1. Check `backend` tag in `pc_fps`.
 2. If using `presentmon_service_api`, confirm the PresentMon API DLLs were discovered and the service is already installed on the host.
-3. Confirm the game is the active foreground target when using `active_foreground`.
+3. Prefer `smart_auto` for production. Use `active_foreground` only if you explicitly want strict foreground binding.
 4. If using RTSS fallback, confirm RTSS is running and shared memory is available.
 5. If using PresentMon console fallback, confirm the path is a standalone console executable and not the GUI `PresentMonApplication` path.
 6. Inspect DEBUG logs for the selected backend before suspecting the scheduler, Influx writer, or Grafana.
@@ -343,7 +346,7 @@ rtss:
   stale_timeout_ms: 2000
 
 presentmon:
-  target_mode: "active_foreground"
+  target_mode: "smart_auto"
   process_name: ""
   process_id: 0
   executable_path: "C:\\ByteTechAgent\\bin\\PresentMon.exe"
@@ -353,8 +356,11 @@ Uwagi:
 
 - domyślny backend to `rtss_shared_memory`
 - `fallback_backend` jest opcjonalny i może mieć wartość `presentmon_console`
-- `active_foreground` pozostaje domyślnym trybem produkcyjnym
+- `smart_auto` jest domyślnym trybem produkcyjnym dla PresentMon Service API
+- `smart_auto` startuje od foreground PID, sprawdza powiązane parent/child procesy, odrzuca oczywiste helpery/przeglądarki/shełle i przez krótki czas po alt-tab zachowuje ostatni dobry PID gry
+- `active_foreground` pozostaje dla kompatybilności wstecznej
 - `explicit_process_name` i `explicit_process_id` pozostają trybami diagnostycznymi
+- `fps_now` mapuje się na application FPS, jeśli PresentMon go udostępnia; jeżeli nie, agent używa displayed FPS. Surowe pola `fps_application_now` i `fps_displayed_now` są również emitowane.
 
 ### Wymagania dla RTSS
 
@@ -464,7 +470,7 @@ pytest -q tests\test_rtss_provider.py tests\test_presentmon_provider.py tests\te
 2. Potwierdź, że RTSS działa.
 3. Potwierdź, że RTSS shared memory jest dostępne.
 4. Uruchom `python -m bytetech_agent.tools.rtss_probe` i sprawdź surowe decyzje `kept` / `rejected` dla wpisów aplikacji.
-5. Przy `active_foreground` upewnij się, że gra jest faktycznie aktywnym oknem.
+5. Preferuj `smart_auto` w produkcji. `active_foreground` używaj tylko wtedy, gdy chcesz wymusić ścisłe wiązanie z aktualnym oknem.
 6. Przy fallbacku PresentMon upewnij się, że ścieżka wskazuje standalone console executable, a nie GUI `PresentMonApplication`.
 7. Jeżeli provider RTSS zgłasza się jako healthy, ale nadal zwraca 0 rekordów, szukaj problemu najpierw w DEBUG logach `rtss_provider`, a nie w schedulerze czy writerze InfluxDB.
 

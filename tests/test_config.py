@@ -1,28 +1,28 @@
-"""Testy konfiguracji ByteTech Agent."""
+"""Configuration tests for ByteTech Agent."""
 import os
 import tempfile
+
 import pytest
 import yaml
 
 from bytetech_agent.config import (
     AppConfig,
+    BufferConfig,
     FpsConfig,
     InfluxConfig,
+    LoggingConfig,
     MetadataConfig,
-    TimingConfig,
-    ProvidersConfig,
+    OptionsConfig,
     PresentMonConfig,
     PresentMonServiceConfig,
+    ProvidersConfig,
     RtssConfig,
-    LoggingConfig,
-    BufferConfig,
-    OptionsConfig,
+    TimingConfig,
     load_config,
 )
 
 
 def _make_config_dict(**overrides):
-    """Helper: tworzy minimalny poprawny config dict."""
     base = {
         "influx": {
             "url": "http://localhost:8086",
@@ -41,10 +41,9 @@ def _make_config_dict(**overrides):
 
 
 def _write_yaml(data: dict) -> str:
-    """Zapisuje dict jako YAML do pliku tymczasowego, zwraca ścieżkę."""
     fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        yaml.dump(data, f)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        yaml.dump(data, handle)
     return path
 
 
@@ -61,7 +60,7 @@ class TestInfluxConfig:
 
 class TestMetadataConfig:
     def test_valid(self):
-        cfg = MetadataConfig(host_alias="PC1", site="Dom", owner="Jan")
+        cfg = MetadataConfig(host_alias="PC1", site="Home", owner="Jan")
         assert cfg.host_alias == "PC1"
 
     def test_missing_required(self):
@@ -91,9 +90,7 @@ class TestProvidersConfig:
         assert cfg.system_provider_enabled is True
 
     def test_field_names_consistency(self):
-        """Sprawdza, że field names są spójne – to co było bugiem w scheduler."""
         cfg = ProvidersConfig()
-        # Sprawdzenie że atrybut istnieje i nie rzuca AttributeError
         assert hasattr(cfg, "nvapi_provider_enabled")
         assert hasattr(cfg, "display_provider_enabled")
         assert hasattr(cfg, "system_provider_enabled")
@@ -114,7 +111,7 @@ class TestBufferConfig:
 class TestPresentMonConfig:
     def test_defaults(self):
         cfg = PresentMonConfig()
-        assert cfg.target_mode == "active_foreground"
+        assert cfg.target_mode == "smart_auto"
         assert cfg.process_name is None
         assert cfg.process_id is None
 
@@ -178,9 +175,13 @@ class TestAppConfig:
     def test_with_overrides(self):
         data = _make_config_dict(
             timing={"hw_interval_sec": 30, "fps_interval_sec": 5},
-            providers={"lhm_enabled": False, "presentmon_enabled": False,
-                       "display_provider_enabled": True, "nvapi_provider_enabled": False,
-                       "system_provider_enabled": True},
+            providers={
+                "lhm_enabled": False,
+                "presentmon_enabled": False,
+                "display_provider_enabled": True,
+                "nvapi_provider_enabled": False,
+                "system_provider_enabled": True,
+            },
         )
         cfg = AppConfig(**data)
         assert cfg.timing.hw_interval_sec == 30
@@ -202,13 +203,46 @@ class TestLoadConfig:
             load_config("/nonexistent/config.yaml")
 
     def test_example_config_is_valid(self):
-        """Sprawdza, że config.example.yaml jest poprawny (parsuje się bez błędów)."""
         example_path = os.path.join(
             os.path.dirname(__file__), "..", "examples", "config.example.yaml"
         )
         if os.path.exists(example_path):
-            with open(example_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-            # Powinno się sparsować bez wyjątku (token/url to stringi, nawet template)
+            with open(example_path, "r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
             cfg = AppConfig(**data)
             assert cfg.influx.url is not None
+
+    def test_load_yaml_with_single_quoted_windows_paths(self):
+        yaml_text = """
+influx:
+  url: 'http://localhost:8086'
+  token: 'test-token'
+  org: 'bytetech'
+  bucket: 'metrics'
+
+metadata:
+  host_alias: 'MY-PC'
+  site: 'Home'
+  owner: 'tester'
+
+presentmon:
+  executable_path: 'C:\\ByteTechAgent\\bin\\PresentMon.exe'
+
+presentmon_service:
+  sdk_path: 'C:\\Program Files\\Intel\\PresentMon\\SDK\\PresentMonAPI2.dll'
+  api_loader_dll: 'C:\\Program Files\\Intel\\PresentMon\\SDK\\PresentMonAPI2Loader.dll'
+  api_runtime_dll: 'C:\\Program Files\\Intel\\PresentMon\\SDK\\PresentMonAPI2.dll'
+  service_dir: 'C:\\Program Files\\Intel\\PresentMonSharedService'
+"""
+        fd, path = tempfile.mkstemp(suffix=".yaml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(yaml_text)
+            cfg = load_config(path)
+            assert cfg.presentmon.executable_path == r"C:\ByteTechAgent\bin\PresentMon.exe"
+            assert cfg.presentmon_service.sdk_path == r"C:\Program Files\Intel\PresentMon\SDK\PresentMonAPI2.dll"
+            assert cfg.presentmon_service.api_loader_dll == r"C:\Program Files\Intel\PresentMon\SDK\PresentMonAPI2Loader.dll"
+            assert cfg.presentmon_service.api_runtime_dll == r"C:\Program Files\Intel\PresentMon\SDK\PresentMonAPI2.dll"
+            assert cfg.presentmon_service.service_dir == r"C:\Program Files\Intel\PresentMonSharedService"
+        finally:
+            os.unlink(path)
